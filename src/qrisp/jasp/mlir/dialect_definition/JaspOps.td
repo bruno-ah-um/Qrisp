@@ -115,10 +115,10 @@ def QuantumGateOp : JaspOp<"quantum_gate"> {
     let description = "This operation enables quantum processing of quantum states with (parametric) gates";
     
     let arguments = (ins StrAttr:$gate_type,
-                         Variadic<AnyTypeOf<[0DTensorOf<[F64]>, QubitType]>>:$gate_operands,
-                         QuantumStateType:$in_qst);
+                         QuantumStateType:$in_qst,
+                         Variadic<AnyTypeOf<[0DTensorOf<[F64]>, QubitType]>>:$gate_operands);
     let results = (outs QuantumStateType:$out_qst);
-    
+
     let assemblyFormat = "$gate_type `(` $gate_operands `)` `,` $in_qst attr-dict `:` `(` type($gate_operands) `)` `,` type($in_qst) `->` type($out_qst)";
 }
 

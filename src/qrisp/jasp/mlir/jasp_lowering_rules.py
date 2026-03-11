@@ -267,12 +267,11 @@ def quantum_gate_lowering(ctx, *args, **params):
     gate_operands = args[:-1]  # All arguments except the last
     quantum_state = args[-1]  # Last argument is the quantum state
 
-    # Create our quantum_gate operation using the generated class
     quantum_gate_op = jasp_dialect.QuantumGateOp(
         get_ir_qst_type(),  # Result type
-        gate_type_attr,  # Gate type as string attribute
-        gate_operands,  # Variadic gate operands (parameters + qubits)
-        quantum_state,  # Input quantum state
+        gate_type_attr,     # Gate type as string attribute
+        quantum_state,      # Input quantum state
+        gate_operands,      # Variadic gate operands (parameters + qubits)
     )
     # Return the result quantum state
     return [quantum_gate_op.results[0]]

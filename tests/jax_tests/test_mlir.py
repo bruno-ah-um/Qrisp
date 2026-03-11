@@ -479,3 +479,95 @@ def test_mlir_jasp_dialect_registration():
     assert "jasp.create_qubits" in mlir_str, "create_qubits op not found in MLIR output"
     assert "jasp.quantum_gate" in mlir_str, "quantum_gate op not found in MLIR output"
     assert "jasp.measure" in mlir_str, "measure op not found in MLIR output"
+
+
+def test_mlir_opt_roundtrip():
+    """
+    Test that the JASP generic MLIR output is accepted by C++ mlir-opt.
+
+    This test is skipped automatically when mlir-opt is not on PATH, so it
+    can be enabled in CI environments where LLVM/MLIR is built with the JASP
+    dialect.
+
+    Two modes are supported:
+
+    1. **Syntax-only** (default): runs with ``--allow-unregistered-dialect``
+       to validate that the output is syntactically correct C++ MLIR, without
+       requiring the compiled JASP dialect plugin.
+
+    2. **Full dialect validation**: if the environment variable
+       ``JASP_DIALECT_LIB`` is set to the path of the compiled
+       ``libJaspDialect.so`` (built from
+       ``src/qrisp/jasp/mlir/dialect_definition/CMakeLists.txt``), the test
+       loads the plugin and runs *without* ``--allow-unregistered-dialect``,
+       exercising full type and op verification against the TableGen spec.
+
+    The "generic MLIR" string tested here is the intermediate representation
+    produced by jaxlib (C++ MLIR) before xDSL re-parses it.  It uses quoted
+    op names (``"jasp.create_qubits"(...)``) and quoted types
+    (``!jasp.QuantumState``), which is the format any C++ MLIR tool would
+    consume.
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from io import StringIO
+
+    import pytest
+
+    mlir_opt = shutil.which("mlir-opt")
+    if mlir_opt is None:
+        pytest.skip("mlir-opt not found on PATH")
+
+    from qrisp import QuantumVariable, cx, h, measure
+    from qrisp.jasp import make_jaspr
+    from qrisp.jasp.mlir.jasp_lowering_rules import jasp_lowering_rules
+    from qrisp.jasp.mlir.jaxpr_lowering import lower_jaxpr_to_MLIR
+
+    def main():
+        qv = QuantumVariable(3)
+        h(qv[0])
+        cx(qv[0], qv[1])
+        result = measure(qv[0])
+        return result
+
+    jaspr = make_jaspr(main)()
+    mlir_module = lower_jaxpr_to_MLIR(jaspr, lowering_rules=jasp_lowering_rules)
+
+    # Capture the generic MLIR string (all ops in quoted generic form)
+    captured = StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    mlir_module.operation.print(print_generic_op_form=True)
+    sys.stdout = old_stdout
+    generic_mlir_str = captured.getvalue()
+
+    with tempfile.NamedTemporaryFile(suffix=".mlir", mode="w", delete=False) as f:
+        f.write(generic_mlir_str)
+        tmp_path = f.name
+
+    dialect_lib = os.environ.get("JASP_DIALECT_LIB")
+    if dialect_lib:
+        # Full JASP dialect validation: load the compiled plugin so that JASP
+        # types/ops are validated against the TableGen spec.  Other dialects
+        # (e.g. stablehlo) are still accepted as unregistered, because mlir-opt
+        # does not bundle them.
+        cmd = [
+            mlir_opt,
+            f"--load-dialect-plugin={dialect_lib}",
+            "--allow-unregistered-dialect",
+            tmp_path,
+        ]
+    else:
+        # Syntax-only: accept unregistered dialects, validates MLIR structure.
+        cmd = [mlir_opt, "--allow-unregistered-dialect", tmp_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    assert result.returncode == 0, (
+        f"mlir-opt failed with exit code {result.returncode}.\n"
+        f"command: {' '.join(cmd)}\n"
+        f"stderr:\n{result.stderr}"
+    )
