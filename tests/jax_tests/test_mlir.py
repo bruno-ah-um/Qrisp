@@ -571,3 +571,209 @@ def test_mlir_opt_roundtrip():
         f"command: {' '.join(cmd)}\n"
         f"stderr:\n{result.stderr}"
     )
+
+
+def test_mlir_opt_roundtrip_reset():
+    """
+    Test that jasp.reset is syntactically valid C++ MLIR.
+
+    Uses a circuit that resets a qubit after a gate, exercising the
+    ResetOp lowering rule.
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from io import StringIO
+
+    import pytest
+
+    mlir_opt = shutil.which("mlir-opt")
+    if mlir_opt is None:
+        pytest.skip("mlir-opt not found on PATH")
+
+    from qrisp import QuantumVariable, cx, h, measure, reset
+    from qrisp.jasp import make_jaspr
+    from qrisp.jasp.mlir.jasp_lowering_rules import jasp_lowering_rules
+    from qrisp.jasp.mlir.jaxpr_lowering import lower_jaxpr_to_MLIR
+
+    def main():
+        qv = QuantumVariable(2)
+        h(qv[0])
+        cx(qv[0], qv[1])
+        reset(qv[1])
+        result = measure(qv[0])
+        return result
+
+    jaspr = make_jaspr(main)()
+    mlir_module = lower_jaxpr_to_MLIR(jaspr, lowering_rules=jasp_lowering_rules)
+
+    captured = StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    mlir_module.operation.print(print_generic_op_form=True)
+    sys.stdout = old_stdout
+    generic_mlir_str = captured.getvalue()
+
+    assert '"jasp.reset"' in generic_mlir_str, "jasp.reset not found in generic MLIR"
+
+    with tempfile.NamedTemporaryFile(suffix=".mlir", mode="w", delete=False) as f:
+        f.write(generic_mlir_str)
+        tmp_path = f.name
+
+    dialect_lib = os.environ.get("JASP_DIALECT_LIB")
+    if dialect_lib:
+        cmd = [mlir_opt, f"--load-dialect-plugin={dialect_lib}", "--allow-unregistered-dialect", tmp_path]
+    else:
+        cmd = [mlir_opt, "--allow-unregistered-dialect", tmp_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    assert result.returncode == 0, (
+        f"mlir-opt failed with exit code {result.returncode}.\n"
+        f"command: {' '.join(cmd)}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_mlir_opt_roundtrip_slice_fuse_getsize():
+    """
+    Test that jasp.slice, jasp.fuse, and jasp.get_size are syntactically
+    valid C++ MLIR.
+
+    - slice: produced by qv[start:stop] indexing on a QubitArray.
+    - get_size: produced by qv[:] (slice with implicit stop).
+    - fuse: produced by concatenating two DynamicQubitArrays with +.
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from io import StringIO
+
+    import pytest
+
+    mlir_opt = shutil.which("mlir-opt")
+    if mlir_opt is None:
+        pytest.skip("mlir-opt not found on PATH")
+
+    from qrisp import QuantumVariable, h, measure
+    from qrisp.jasp import make_jaspr
+    from qrisp.jasp.mlir.jasp_lowering_rules import jasp_lowering_rules
+    from qrisp.jasp.mlir.jaxpr_lowering import lower_jaxpr_to_MLIR
+
+    def main():
+        qv1 = QuantumVariable(4)
+        qv2 = QuantumVariable(2)
+        h(qv1[0])
+        # slice: qv1[1:3] → slice_p
+        sub = qv1[1:3]
+        h(sub[0])
+        # fuse: concatenate the two registers → fuse_p
+        fused = qv1.reg + qv2.reg
+        # get_size: qv1[:] uses implicit stop → get_size_p internally
+        full = qv1[:]
+        result = measure(qv1[0])
+        return result
+
+    jaspr = make_jaspr(main)()
+    mlir_module = lower_jaxpr_to_MLIR(jaspr, lowering_rules=jasp_lowering_rules)
+
+    captured = StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    mlir_module.operation.print(print_generic_op_form=True)
+    sys.stdout = old_stdout
+    generic_mlir_str = captured.getvalue()
+
+    assert '"jasp.slice"' in generic_mlir_str, "jasp.slice not found in generic MLIR"
+    assert '"jasp.fuse"' in generic_mlir_str, "jasp.fuse not found in generic MLIR"
+    assert '"jasp.get_size"' in generic_mlir_str, "jasp.get_size not found in generic MLIR"
+
+    with tempfile.NamedTemporaryFile(suffix=".mlir", mode="w", delete=False) as f:
+        f.write(generic_mlir_str)
+        tmp_path = f.name
+
+    dialect_lib = os.environ.get("JASP_DIALECT_LIB")
+    if dialect_lib:
+        cmd = [mlir_opt, f"--load-dialect-plugin={dialect_lib}", "--allow-unregistered-dialect", tmp_path]
+    else:
+        cmd = [mlir_opt, "--allow-unregistered-dialect", tmp_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    assert result.returncode == 0, (
+        f"mlir-opt failed with exit code {result.returncode}.\n"
+        f"command: {' '.join(cmd)}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_mlir_opt_roundtrip_parity():
+    """
+    Test that jasp.parity is syntactically valid C++ MLIR.
+
+    Uses a GHZ-state circuit where parity of all qubit measurements
+    is computed, exercising the ParityOp lowering rule.
+    """
+    import os
+    import shutil
+    import subprocess
+    import sys
+    import tempfile
+    from io import StringIO
+
+    import pytest
+
+    mlir_opt = shutil.which("mlir-opt")
+    if mlir_opt is None:
+        pytest.skip("mlir-opt not found on PATH")
+
+    from qrisp import QuantumVariable, cx, h, measure
+    from qrisp.jasp import make_jaspr, parity
+    from qrisp.jasp.mlir.jasp_lowering_rules import jasp_lowering_rules
+    from qrisp.jasp.mlir.jaxpr_lowering import lower_jaxpr_to_MLIR
+
+    def main():
+        qv = QuantumVariable(4)
+        h(qv[0])
+        cx(qv[0], qv[1])
+        cx(qv[0], qv[2])
+        cx(qv[0], qv[3])
+        a = measure(qv[0])
+        b = measure(qv[1])
+        c = measure(qv[2])
+        d = measure(qv[3])
+        return parity(a, b, c, d)
+
+    jaspr = make_jaspr(main)()
+    mlir_module = lower_jaxpr_to_MLIR(jaspr, lowering_rules=jasp_lowering_rules)
+
+    captured = StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = captured
+    mlir_module.operation.print(print_generic_op_form=True)
+    sys.stdout = old_stdout
+    generic_mlir_str = captured.getvalue()
+
+    assert '"jasp.parity"' in generic_mlir_str, "jasp.parity not found in generic MLIR"
+
+    with tempfile.NamedTemporaryFile(suffix=".mlir", mode="w", delete=False) as f:
+        f.write(generic_mlir_str)
+        tmp_path = f.name
+
+    dialect_lib = os.environ.get("JASP_DIALECT_LIB")
+    if dialect_lib:
+        cmd = [mlir_opt, f"--load-dialect-plugin={dialect_lib}", "--allow-unregistered-dialect", tmp_path]
+    else:
+        cmd = [mlir_opt, "--allow-unregistered-dialect", tmp_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    assert result.returncode == 0, (
+        f"mlir-opt failed with exit code {result.returncode}.\n"
+        f"command: {' '.join(cmd)}\n"
+        f"stderr:\n{result.stderr}"
+    )
