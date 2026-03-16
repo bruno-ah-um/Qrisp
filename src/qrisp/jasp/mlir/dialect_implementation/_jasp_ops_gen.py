@@ -337,13 +337,13 @@ class QuantumGateOp(_ods_ir.OpView):
 
   _ODS_REGIONS = (0, True)
 
-  def __init__(self, out_qst, gate_type, in_qst, gate_operands, *, loc=None, ip=None):
+  def __init__(self, out_qst, gate_type, gate_operands, in_qst, *, loc=None, ip=None):
     operands = []
     results = []
     attributes = {}
     regions = None
-    operands.append(_get_op_result_or_value(in_qst))
     operands.extend(_get_op_results_or_values(gate_operands))
+    operands.append(_get_op_result_or_value(in_qst))
     _ods_context = _ods_get_default_loc_context(loc)
     attributes["gate_type"] = (gate_type if (
     isinstance(gate_type, _ods_ir.Attribute) or
@@ -354,13 +354,14 @@ class QuantumGateOp(_ods_ir.OpView):
     super().__init__(self.build_generic(attributes=attributes, results=results, operands=operands, successors=_ods_successors, regions=regions, loc=loc, ip=ip))
 
   @builtins.property
-  def in_qst(self):
-    return self.operation.operands[0]
-
-  @builtins.property
   def gate_operands(self):
     _ods_variadic_group_length = len(self.operation.operands) - 2 + 1
-    return self.operation.operands[1:1 + _ods_variadic_group_length]
+    return self.operation.operands[0:0 + _ods_variadic_group_length]
+
+  @builtins.property
+  def in_qst(self):
+    _ods_variadic_group_length = len(self.operation.operands) - 2 + 1
+    return self.operation.operands[1 + _ods_variadic_group_length - 1]
 
   @builtins.property
   def gate_type(self):
@@ -376,8 +377,8 @@ class QuantumGateOp(_ods_ir.OpView):
   def out_qst(self):
     return self.operation.results[0]
 
-def quantum_gate(out_qst, gate_type, in_qst, gate_operands, *, loc=None, ip=None) -> _ods_ir.Value:
-  return _get_op_result_or_op_results(QuantumGateOp(out_qst=out_qst, gate_type=gate_type, in_qst=in_qst, gate_operands=gate_operands, loc=loc, ip=ip))
+def quantum_gate(out_qst, gate_type, gate_operands, in_qst, *, loc=None, ip=None) -> _ods_ir.Value:
+  return _get_op_result_or_op_results(QuantumGateOp(out_qst=out_qst, gate_type=gate_type, gate_operands=gate_operands, in_qst=in_qst, loc=loc, ip=ip))
 
 @_ods_cext.register_operation(_Dialect)
 class ResetOp(_ods_ir.OpView):

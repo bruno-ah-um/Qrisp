@@ -27,8 +27,11 @@ Two key steps happen here:
 
 from xdsl.dialects import builtin
 
+from qrisp.jasp.mlir.drop_dead_wrappers import drop_dead_wrappers
+from qrisp.jasp.mlir.hoist_classical_ops import hoist_classical_ops
 from qrisp.jasp.mlir.jaxpr_lowering import jaxpr_to_xdsl
 from qrisp.jasp.mlir.jasp_lowering_rules import jasp_lowering_rules
+from qrisp.jasp.mlir.lift_quantum_kernels import lift_quantum_kernels
 from qrisp.jasp.mlir.quantum_control_flow import fix_quantum_control_flow
 
 from qrisp.jasp.jasp_expression import Jaspr
@@ -38,5 +41,8 @@ def jaspr_to_mlir(jaspr: Jaspr) -> builtin.ModuleOp:
 
     xdsl_module = jaxpr_to_xdsl(jaspr, lowering_rules=jasp_lowering_rules)
     fix_quantum_control_flow(xdsl_module)
+    lift_quantum_kernels(xdsl_module)
+    hoist_classical_ops(xdsl_module)
+    drop_dead_wrappers(xdsl_module)
 
     return xdsl_module

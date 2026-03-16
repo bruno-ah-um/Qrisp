@@ -1,5 +1,7 @@
 include "mlir/IR/OpBase.td"
 include "mlir/IR/BuiltinTypes.td"
+include "mlir/IR/SymbolInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
 include "JaspDialect.td"
 
 //===----------------------------------------------------------------------===//
@@ -16,7 +18,7 @@ def CreateQubitsOp : JaspOp<"create_qubits"> {
     let arguments = (ins 0DTensorOf<[I64]>:$amount, QuantumStateType:$qst_in);
     let results = (outs QubitArrayType:$result, QuantumStateType:$qst_out);
     
-    let assemblyFormat = "$amount attr-dict `,` $qst_in  `:` type($qst_in) `,` type($amount) `->` type($result) `,` type($qst_out)";
+    let assemblyFormat = "$amount attr-dict `,` $qst_in  `:` type($qst_in) `,` type($amount) `->` type($result)";
 }
 
 def GetQubitOp : JaspOp<"get_qubit"> {
@@ -90,6 +92,23 @@ def DeleteQubitsOp : JaspOp<"delete_qubits"> {
     let assemblyFormat = "$qubits `,` $in_qst attr-dict `:` type($qubits) `,` type($in_qst) `->` type($out_qst)";
 }
 
+def JaspModuleOp : JaspOp<"module", [
+        IsolatedFromAbove,
+        SymbolTable,
+        Symbol]> {
+    let summary = "Container for quantum kernel functions.";
+    let description = [{
+        A module-like container that holds all jasp.quantum_kernel ops,
+        separating QPU code from classical host code at the IR level.
+        Analogous to gpu.module in the GPU dialect.
+    }];
+
+    let arguments = (ins SymbolNameAttr:$sym_name);
+    let regions = (region SizedRegion<1>:$body);
+
+    let assemblyFormat = "$sym_name $body attr-dict";
+}
+
 def CreateQuantumKernelOp : JaspOp<"create_quantum_kernel"> {
     let summary = "Creates a quantum state from nothing.";
     let description = "Indicates to the execution environment that a quantum computation will start.";
@@ -115,19 +134,79 @@ def QuantumGateOp : JaspOp<"quantum_gate"> {
     let description = "This operation enables quantum processing of quantum states with (parametric) gates";
     
     let arguments = (ins StrAttr:$gate_type,
-                         QuantumStateType:$in_qst,
-                         Variadic<AnyTypeOf<[0DTensorOf<[F64]>, QubitType]>>:$gate_operands);
+                         Variadic<AnyTypeOf<[0DTensorOf<[F64]>, QubitType]>>:$gate_operands,
+                         QuantumStateType:$in_qst);
     let results = (outs QuantumStateType:$out_qst);
-
+    
     let assemblyFormat = "$gate_type `(` $gate_operands `)` `,` $in_qst attr-dict `:` `(` type($gate_operands) `)` `,` type($in_qst) `->` type($out_qst)";
 }
 
 def ParityOp : JaspOp<"parity"> {
     let summary = "Computes parity of measurement results.";
     let description = "Computes the parity (XOR sum) of a set of measurement results. Supports expectation and observable attributes for error correction contexts.";
-    
+
     let arguments = (ins Variadic<0DTensorOf<[I1]>>:$measurements, I64Attr:$expectation, I64Attr:$observable);
     let results = (outs 0DTensorOf<[I1]>:$result);
-    
+
     let assemblyFormat = "$measurements attr-dict `:` type($measurements) `->` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// Quantum kernel ops  (analogous to gpu.func / gpu.return / gpu.launch_func)
+//===----------------------------------------------------------------------===//
+
+def QuantumKernelOp : JaspOp<"quantum_kernel", [
+        IsolatedFromAbove,
+        NoTerminator,
+        Symbol,
+        HasParent<"JaspModuleOp">]> {
+    let summary = "A self-contained quantum function, analogous to func.func.";
+    let description = [{
+        The *declared* function type is classical-only — QuantumState does not
+        appear in the external signature.  Inside the body region the entry
+        block receives the classical parameters followed by a trailing
+        !jasp.QuantumState argument, and jasp.return yields the classical
+        results followed by a trailing !jasp.QuantumState operand.
+
+        This makes quantum functions unambiguously identifiable in the IR
+        without scanning the function body for sentinel ops.
+    }];
+
+    let arguments = (ins SymbolNameAttr:$sym_name,
+                         TypeAttrOf<FunctionType>:$function_type,
+                         OptionalAttr<StrAttr>:$sym_visibility);
+    let regions = (region SizedRegion<1>:$body);
+
+}
+
+def JaspReturnOp : JaspOp<"return", [
+        Terminator,
+        HasParent<"QuantumKernelOp">]> {
+    let summary = "Terminator for jasp.quantum_kernel bodies.";
+    let description = [{
+        Operands: (<classical results...>, !jasp.QuantumState)
+        The trailing QuantumState is the final state of the quantum
+        computation; it is consumed by the kernel boundary and not visible
+        to callers.
+    }];
+
+    let arguments = (ins Variadic<AnyType>:$values);
+
+    let assemblyFormat = "($values^ `:` type($values))? attr-dict";
+}
+
+def JaspCallOp : JaspOp<"call"> {
+    let summary = "Calls a jasp.quantum_kernel by symbol.";
+    let description = [{
+        From the caller's perspective the operation is purely classical —
+        no QuantumState appears in operands or results.  The callee's
+        internal QuantumState lifecycle is managed by the kernel boundary.
+    }];
+
+    let arguments = (ins FlatSymbolRefAttr:$callee,
+                         Variadic<AnyType>:$arguments);
+    let results = (outs Variadic<AnyType>:$res);
+
+    let assemblyFormat =
+        "$callee `(` $arguments `)` attr-dict `:` functional-type($arguments, $res)";
 }

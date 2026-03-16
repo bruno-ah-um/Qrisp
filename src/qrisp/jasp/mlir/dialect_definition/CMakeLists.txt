@@ -78,6 +78,7 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/JaspDialect.cpp")
 #include \"mlir/Bytecode/BytecodeOpInterface.h\"
 #include \"mlir/IR/Builders.h\"
 #include \"mlir/IR/DialectImplementation.h\"
+#include \"mlir/IR/SymbolTable.h\"
 #include \"mlir/Tools/Plugins/DialectPlugin.h\"
 #include \"llvm/ADT/TypeSwitch.h\"
 
@@ -114,6 +115,12 @@ if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/JaspDialect.cpp")
 // ---------------------------------------------------------------------------
 
 void jasp::JaspDialect::initialize() {
+    // Allow ops unknown to this plugin (e.g. jasp.quantum_kernel, jasp.return,
+    // jasp.call) so that the statically-linked TypeID mismatch between mlir-opt
+    // and the plugin does not break terminator/trait checks.  Unknown ops are
+    // still accepted by --allow-unregistered-dialect.
+    allowUnknownOperations();
+
     addTypes<
         jasp::QuantumStateType,
         jasp::QubitType,
@@ -131,7 +138,8 @@ void jasp::JaspDialect::initialize() {
         jasp::CreateQuantumKernelOp,
         jasp::ConsumeQuantumKernelOp,
         jasp::QuantumGateOp,
-        jasp::ParityOp
+        jasp::ParityOp,
+        jasp::JaspModuleOp
     >();
 }
 

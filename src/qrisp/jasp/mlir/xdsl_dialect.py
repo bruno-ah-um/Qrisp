@@ -28,14 +28,18 @@ This module registers the JASP dialect with xDSL so that:
 
 from xdsl.dialects.builtin import (
     ArrayAttr,
+    FlatSymbolRefAttr,
+    FunctionType,
     IntegerAttr,
     StringAttr,
+    SymbolRefAttr,
     TensorType,
     f64,
     i1,
     i64,
 )
-from xdsl.ir import Dialect, ParametrizedAttribute, TypeAttribute
+from xdsl.dialects.func import FlatSymbolRefAttrConstr, parse_func_op_like, print_func_op_like
+from xdsl.ir import Dialect, ParametrizedAttribute, Region, TypeAttribute
 from xdsl.utils.exceptions import VerifyException
 from xdsl.irdl import (
     AnyAttr,
@@ -48,10 +52,17 @@ from xdsl.irdl import (
     irdl_op_definition,
     irdl_to_attr_constraint,
     operand_def,
+    opt_prop_def,
+    prop_def,
+    region_def,
     result_def,
+    traits_def,
     var_operand_def,
+    var_result_def,
 )
+from xdsl.parser import Parser
 from xdsl.printer import Printer
+from xdsl.traits import IsolatedFromAbove, IsTerminator, SymbolOpInterface
 
 
 def _scalar_tensor(elem_type):
@@ -406,6 +417,207 @@ class ParityOp(IRDLOperation):
         printer.print_attribute(self.result.type)
 
 
+@irdl_op_definition
+class JaspModuleOp(IRDLOperation):
+    """Container for jasp.quantum_kernel ops — analogous to gpu.module.
+
+    All quantum kernels live inside a jasp.module, separating QPU code from
+    classical host code at the IR level.  A downstream pass can identify all
+    QPU work by iterating the body of the jasp.module rather than scanning
+    the whole builtin.module.
+    """
+
+    name = "jasp.module"
+
+    body = region_def()
+    sym_name = prop_def(StringAttr)
+
+    traits = traits_def(IsolatedFromAbove(), SymbolOpInterface())
+
+    def __init__(self, module_name: str, region: Region):
+        super().__init__(
+            properties={"sym_name": StringAttr(module_name)},
+            regions=[region],
+        )
+
+    @classmethod
+    def parse(cls, parser: Parser) -> "JaspModuleOp":
+        sym_name = parser.parse_symbol_name()  # returns StringAttr
+        region = parser.parse_region()
+        return cls(module_name=sym_name.data, region=region)
+
+    def print(self, printer: Printer) -> None:
+        printer.print_string(f" @{self.sym_name.data}")
+        printer.print_region(self.body)
+
+
+@irdl_op_definition
+class QuantumKernelOp(IRDLOperation):
+    """A self-contained quantum function, analogous to func.func.
+
+    The *declared* function type is classical-only — QuantumState does not
+    appear in the external signature.  Inside the body region the entry block
+    receives the classical parameters followed by a trailing
+    ``!jasp.QuantumState`` argument, and ``jasp.return`` yields the classical
+    results followed by a trailing ``!jasp.QuantumState`` operand.
+
+    This makes quantum functions unambiguously identifiable in the IR without
+    scanning the function body for sentinel ops.
+    """
+
+    name = "jasp.quantum_kernel"
+
+    body = region_def()
+    sym_name = prop_def(StringAttr)
+    function_type = prop_def(FunctionType)  # classical types only — no QuantumState
+    sym_visibility = opt_prop_def(StringAttr)
+
+    traits = traits_def(IsolatedFromAbove(), SymbolOpInterface())
+
+    def __init__(
+        self,
+        kernel_name: str,
+        function_type: FunctionType,
+        region: Region,
+        visibility: str | StringAttr | None = None,
+    ):
+        if isinstance(visibility, str):
+            visibility = StringAttr(visibility)
+        properties = {
+            "sym_name": StringAttr(kernel_name),
+            "function_type": function_type,
+            "sym_visibility": visibility,
+        }
+        super().__init__(properties=properties, regions=[region])
+
+    def verify_(self) -> None:
+        if not isinstance(self.parent_op(), JaspModuleOp):
+            raise VerifyException(
+                "jasp.quantum_kernel must be inside a jasp.module"
+            )
+        if len(self.body.blocks) == 0:
+            return
+        entry = self.body.blocks.first
+        assert entry is not None
+        arg_types = list(entry.arg_types)
+        if not arg_types or not isinstance(arg_types[-1], QuantumStateType):
+            raise VerifyException(
+                "jasp.quantum_kernel: entry block must have !jasp.QuantumState "
+                "as its last argument"
+            )
+        classical_args = tuple(arg_types[:-1])
+        if classical_args != tuple(self.function_type.inputs):
+            raise VerifyException(
+                "jasp.quantum_kernel: entry block classical arguments must match "
+                "the declared function_type inputs"
+            )
+        for op in entry.ops:
+            if isinstance(op, JaspReturnOp):
+                classical_results = tuple(v.type for v in op.values[:-1])
+                if classical_results != tuple(self.function_type.outputs):
+                    raise VerifyException(
+                        "jasp.quantum_kernel: jasp.return classical types must match "
+                        "declared function_type outputs"
+                    )
+
+    @classmethod
+    def parse(cls, parser: Parser) -> "QuantumKernelOp":
+        visibility = parser.parse_optional_visibility_keyword()
+        (name, input_types, return_types, region, extra_attrs, _, _) = (
+            parse_func_op_like(
+                parser,
+                reserved_attr_names=("sym_name", "function_type", "sym_visibility"),
+            )
+        )
+        op = cls(
+            kernel_name=name,
+            function_type=FunctionType.from_lists(input_types, return_types),
+            region=region,
+            visibility=visibility,
+        )
+        if extra_attrs is not None:
+            op.attributes |= extra_attrs.data
+        return op
+
+    def print(self, printer: Printer) -> None:
+        if self.sym_visibility:
+            printer.print_string(f" {self.sym_visibility.data}")
+        # Collect non-reserved attributes to pass through.
+        reserved = {"sym_name", "function_type", "sym_visibility"}
+        extra_attrs = {k: v for k, v in self.attributes.items() if k not in reserved}
+        print_func_op_like(
+            printer,
+            self.sym_name,
+            self.function_type,
+            self.body,
+            extra_attrs,
+            reserved_attr_names=list(reserved),
+        )
+
+
+@irdl_op_definition
+class JaspReturnOp(IRDLOperation):
+    """Terminator for jasp.quantum_kernel bodies.
+
+    Operands: (!jasp.QuantumState, <classical results...>)
+
+    The leading QuantumState is the final state of the quantum computation;
+    it is consumed by the kernel boundary and not visible to callers.
+    """
+
+    name = "jasp.return"
+
+    values = var_operand_def()
+
+    traits = traits_def(IsTerminator())
+
+    def __init__(self, values):
+        super().__init__(operands=[values])
+
+    assembly_format = "($values^ `:` type($values))? attr-dict"
+
+    def verify_(self) -> None:
+        if not self.values or not isinstance(self.values[-1].type, QuantumStateType):
+            raise VerifyException(
+                "jasp.return: last operand must be !jasp.QuantumState"
+            )
+
+
+@irdl_op_definition
+class JaspCallOp(IRDLOperation):
+    """Calls a jasp.quantum_kernel by symbol.
+
+    From the caller's perspective the operation is purely classical — no
+    QuantumState appears in operands or results.  The callee's internal
+    QuantumState lifecycle is an implementation detail managed by the kernel
+    boundary.
+    """
+
+    name = "jasp.call"
+
+    callee = prop_def(FlatSymbolRefAttrConstr)
+    arguments = var_operand_def()
+    res = var_result_def()
+
+    assembly_format = (
+        "$callee `(` $arguments `)` attr-dict `:` functional-type($arguments, $res)"
+    )
+
+    def __init__(
+        self,
+        callee: str | SymbolRefAttr | FlatSymbolRefAttr,
+        arguments,
+        return_types,
+    ):
+        if isinstance(callee, str):
+            callee = SymbolRefAttr(callee)
+        super().__init__(
+            operands=[arguments],
+            result_types=[return_types],
+            properties={"callee": callee},
+        )
+
+
 # ---------------------------------------------------------------------------
 # Dialect
 # ---------------------------------------------------------------------------
@@ -432,5 +644,9 @@ class JaspDialect(Dialect):
         ConsumeQuantumKernelOp,
         QuantumGateOp,
         ParityOp,
+        JaspModuleOp,
+        QuantumKernelOp,
+        JaspReturnOp,
+        JaspCallOp,
     ]
     attributes = [QuantumStateType, QubitType, QubitArrayType]

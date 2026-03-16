@@ -481,6 +481,71 @@ def test_mlir_jasp_dialect_registration():
     assert "jasp.measure" in mlir_str, "measure op not found in MLIR output"
 
 
+def test_mlir_quantum_kernel_lifting():
+    """
+    Test that the quantum_kernel decorator produces a jasp.quantum_kernel op
+    and a jasp.call at the call site, replacing the create/consume sentinel pair.
+    """
+    from qrisp import QuantumFloat, measure
+    from qrisp.jasp import make_jaspr, quantum_kernel
+    from qrisp.jasp.mlir.mlir_emission import jaspr_to_mlir
+
+    @quantum_kernel
+    def inner(k):
+        qf = QuantumFloat(4)
+        return measure(qf)
+
+    def main(k):
+        return inner(k)
+
+    jaspr = make_jaspr(main)(1)
+    xdsl_module = jaspr_to_mlir(jaspr)
+    mlir_str = str(xdsl_module)
+
+    # All quantum kernels must be collected inside a jasp.module container.
+    assert "jasp.module" in mlir_str, \
+        "Expected jasp.module container in MLIR output"
+
+    # The callee must be promoted to jasp.quantum_kernel inside jasp.module.
+    assert "jasp.quantum_kernel" in mlir_str, \
+        "Expected jasp.quantum_kernel op in MLIR output"
+
+    # The call site must be a jasp.call (purely classical).
+    assert "jasp.call" in mlir_str, \
+        "Expected jasp.call op in MLIR output"
+
+    # The body terminator must be jasp.return.
+    assert "jasp.return" in mlir_str, \
+        "Expected jasp.return in quantum kernel body"
+
+    # The user-written quantum kernel should be promoted to jasp.quantum_kernel
+    # inside the jasp.module container.
+    assert "jasp.quantum_kernel @inner" in mlir_str or \
+           "jasp.quantum_kernel private @inner" in mlir_str, \
+        "Expected user quantum kernel to be promoted to jasp.quantum_kernel"
+
+    # jasp.quantum_kernel must be inside jasp.module, not at the top level.
+    from qrisp.jasp.mlir.xdsl_dialect import JaspModuleOp, QuantumKernelOp
+    from xdsl.dialects import func as func_dialect
+    top_level_ops = list(xdsl_module.body.blocks[0].ops)
+    assert not any(isinstance(op, QuantumKernelOp) for op in top_level_ops), \
+        "jasp.quantum_kernel should be inside jasp.module, not at top level"
+    jasp_mod = next((op for op in top_level_ops if isinstance(op, JaspModuleOp)), None)
+    assert jasp_mod is not None, "Expected a jasp.module op at top level"
+    kernel_names = {op.sym_name.data for op in jasp_mod.body.blocks[0].ops
+                    if isinstance(op, QuantumKernelOp)}
+    assert "inner" in kernel_names, \
+        f"Expected 'inner' kernel inside jasp.module, found: {kernel_names}"
+
+    # The call site must NOT thread QuantumState explicitly.
+    # A jasp.call line should only carry classical types.
+    import re
+    call_lines = [l for l in mlir_str.splitlines() if "jasp.call" in l]
+    for line in call_lines:
+        assert "QuantumState" not in line, \
+            f"jasp.call should not mention QuantumState: {line}"
+
+
 def test_mlir_opt_roundtrip():
     """
     Test that the JASP generic MLIR output is accepted by C++ mlir-opt.
@@ -767,6 +832,90 @@ def test_mlir_opt_roundtrip_parity():
     dialect_lib = os.environ.get("JASP_DIALECT_LIB")
     if dialect_lib:
         cmd = [mlir_opt, f"--load-dialect-plugin={dialect_lib}", "--allow-unregistered-dialect", tmp_path]
+    else:
+        cmd = [mlir_opt, "--allow-unregistered-dialect", tmp_path]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    assert result.returncode == 0, (
+        f"mlir-opt failed with exit code {result.returncode}.\n"
+        f"command: {' '.join(cmd)}\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_mlir_opt_roundtrip_quantum_kernel():
+    """
+    Test that the xDSL output containing jasp.module / jasp.quantum_kernel /
+    jasp.call / jasp.return is syntactically valid C++ MLIR.
+
+    Unlike the other roundtrip tests (which validate the pre-xDSL JAX MLIR),
+    this test runs the *full* pipeline — including lift_quantum_kernels and
+    drop_dead_wrappers — and then validates the resulting xDSL module.
+
+    Because jasp.quantum_kernel uses a custom assembly format in xDSL, the
+    module is serialised in generic MLIR form before being handed to mlir-opt,
+    so the test works in syntax-only mode (--allow-unregistered-dialect)
+    without needing the compiled dialect plugin.
+    """
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+    from io import StringIO
+
+    import pytest
+
+    mlir_opt = shutil.which("mlir-opt")
+    if mlir_opt is None:
+        pytest.skip("mlir-opt not found on PATH")
+
+    from xdsl.printer import Printer
+
+    from qrisp import QuantumFloat, cx, h, measure
+    from qrisp.jasp import make_jaspr, quantum_kernel
+    from qrisp.jasp.mlir.mlir_emission import jaspr_to_mlir
+    import jax.numpy as jnp
+
+    @quantum_kernel
+    def sampling_kernel(k):
+        qf = QuantumFloat(4)
+        h(qf[k])
+        cx(qf[k], qf[0])
+        return measure(qf)
+
+    def main(k):
+        return sampling_kernel(k)
+
+    jaspr = make_jaspr(main)(jnp.int64(1))
+    xdsl_module = jaspr_to_mlir(jaspr)
+
+    # Verify the new ops are present in the xDSL output.
+    mlir_str = str(xdsl_module)
+    assert "jasp.module" in mlir_str, "Expected jasp.module in xDSL output"
+    assert "jasp.quantum_kernel" in mlir_str, "Expected jasp.quantum_kernel in xDSL output"
+    assert "jasp.call" in mlir_str, "Expected jasp.call in xDSL output"
+    assert "jasp.return" in mlir_str, "Expected jasp.return in xDSL output"
+
+    # Serialise in generic form so mlir-opt can parse it without the custom
+    # assembly format implementation (--allow-unregistered-dialect).
+    buf = StringIO()
+    printer = Printer(stream=buf, print_generic_format=True)
+    printer.print_op(xdsl_module)
+    generic_mlir_str = buf.getvalue()
+
+    with tempfile.NamedTemporaryFile(suffix=".mlir", mode="w", delete=False) as f:
+        f.write(generic_mlir_str)
+        tmp_path = f.name
+
+    dialect_lib = os.environ.get("JASP_DIALECT_LIB")
+    if dialect_lib:
+        cmd = [
+            mlir_opt,
+            f"--load-dialect-plugin={dialect_lib}",
+            "--allow-unregistered-dialect",
+            tmp_path,
+        ]
     else:
         cmd = [mlir_opt, "--allow-unregistered-dialect", tmp_path]
 
