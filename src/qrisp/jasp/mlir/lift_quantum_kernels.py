@@ -19,8 +19,10 @@
 """
 xDSL pass: lift_quantum_kernels
 ================================
-Transforms the create/consume quantum kernel sentinel pattern into a proper
-``jasp.quantum_kernel`` function-defining op with a ``jasp.call`` call site.
+Replaces the create/consume quantum kernel sentinel pattern with a
+``jasp.call`` at the call site.  The callee ``func.func`` is left unchanged
+— it is identified as a quantum kernel by having ``!jasp.QuantumState`` as
+its last input and output.
 
 Before (emitted by JAX lowering)::
 
@@ -39,18 +41,14 @@ After::
         %result = jasp.call @my_kernel(%arg) : (tensor<i64>) -> tensor<f64>
         func.return %result, %qst_outer : ...
     }
-    jasp.quantum_kernel @my_kernel(%arg: tensor<i64>) -> tensor<f64> {
-    ^bb0(%arg: tensor<i64>, %qst: !jasp.QuantumState):
-        ...
-        jasp.return %result, %qst_out : tensor<f64>, !jasp.QuantumState
-    }
+    func.func private @my_kernel(%arg: tensor<i64>, %qst: !jasp.QuantumState)
+            -> (tensor<f64>, !jasp.QuantumState) { ... }
 
-Convention: QuantumState is the **last** argument and **last** result in both
-the callee's function type and its entry block — this matches the JAX lowering
-convention.
+Convention: QuantumState is the **last** argument and **last** result in the
+callee's function type — this matches the JAX lowering convention.
 """
 
-from xdsl.dialects.builtin import FunctionType, ModuleOp, SymbolRefAttr
+from xdsl.dialects.builtin import FunctionType, ModuleOp, StringAttr
 from xdsl.dialects.func import CallOp, FuncOp, ReturnOp
 from xdsl.ir import Block, Region
 from xdsl.rewriter import Rewriter
@@ -64,11 +62,8 @@ from qrisp.jasp.mlir.xdsl_dialect import (
     GetQubitOp,
     GetSizeOp,
     JaspCallOp,
-    JaspModuleOp,
-    JaspReturnOp,
     MeasureOp,
     QuantumGateOp,
-    QuantumKernelOp,
     QuantumStateType,
     ResetOp,
     SliceOp,
@@ -148,45 +143,6 @@ def _find_kernel_pattern(func_op: FuncOp):
     return None
 
 
-def _convert_callee(func_op: FuncOp) -> QuantumKernelOp:
-    """
-    Convert a ``func.func`` whose last input/output is ``!jasp.QuantumState``
-    into a ``jasp.quantum_kernel`` with an equivalent body.
-
-    The body is moved as-is (block args and SSA values remain intact).
-    Each ``func.return`` in the body is replaced with ``jasp.return``.
-    """
-    old_ftype = func_op.function_type
-
-    # Strip QuantumState from the declared type → classical-only external type.
-    classical_inputs = list(old_ftype.inputs)[:-1]
-    classical_outputs = list(old_ftype.outputs)[:-1]
-    new_ftype = FunctionType.from_lists(classical_inputs, classical_outputs)
-
-    # Rewrite func.return → jasp.return inside the body.
-    # We must collect ops first to avoid mutating while iterating.
-    returns_to_rewrite = []
-    for block in func_op.body.blocks:
-        for op in block.ops:
-            if isinstance(op, ReturnOp):
-                returns_to_rewrite.append(op)
-
-    for ret_op in returns_to_rewrite:
-        jasp_ret = JaspReturnOp(list(ret_op.arguments))
-        Rewriter.replace_op(ret_op, jasp_ret, new_results=[])
-
-    # Detach the region from the old func.func and give it to the new op.
-    region = func_op.detach_region(func_op.body)
-
-    kernel_op = QuantumKernelOp(
-        kernel_name=func_op.sym_name.data,
-        function_type=new_ftype,
-        region=region,
-        visibility=func_op.sym_visibility,
-    )
-    return kernel_op
-
-
 def _has_quantum_ops(op) -> bool:
     """Recursively walk all nested regions to find any JASP quantum op."""
     for region in op.regions:
@@ -200,9 +156,9 @@ def _has_quantum_ops(op) -> bool:
 
 
 def _lift_implicit_main_kernel(module: ModuleOp) -> None:
-    """Promote ``func.func @main`` to a ``jasp.quantum_kernel`` when it
-    contains quantum ops directly (i.e. no explicit ``@quantum_kernel``
-    decorator was used).
+    """Extract the quantum body of ``func.func @main`` into a separate
+    ``func.func @main_kernel`` when ``@main`` contains quantum ops directly
+    (i.e. no explicit ``@quantum_kernel`` decorator was used).
 
     Before::
 
@@ -218,11 +174,11 @@ def _lift_implicit_main_kernel(module: ModuleOp) -> None:
             %result = jasp.call @main_kernel() : () -> tensor<i64>
             func.return %result : tensor<i64>
         }
-        jasp.quantum_kernel @main_kernel() -> tensor<i64> {
-        ^bb0(%qst: !jasp.QuantumState):
+        func.func private @main_kernel(%qst: !jasp.QuantumState)
+                -> (tensor<i64>, !jasp.QuantumState) {
             %qa, %qst1 = jasp.create_qubits ...
             ...
-            jasp.return %result, %qst_n : ...
+            func.return %result, %qst_n : ...
         }
     """
     module_block = module.body.blocks.first
@@ -254,26 +210,12 @@ def _lift_implicit_main_kernel(module: ModuleOp) -> None:
     old_ftype = main_op.function_type
     classical_inputs = list(old_ftype.inputs)[:-1]   # drop trailing QuantumState
     classical_outputs = list(old_ftype.outputs)[:-1]  # drop trailing QuantumState
-    new_ftype = FunctionType.from_lists(classical_inputs, classical_outputs)
 
-    # --- Rewrite func.return → jasp.return inside the body ---
-    returns_to_rewrite = [
-        op
-        for block in main_op.body.blocks
-        for op in block.ops
-        if isinstance(op, ReturnOp)
-    ]
-    for ret_op in returns_to_rewrite:
-        jasp_ret = JaspReturnOp(list(ret_op.arguments))
-        Rewriter.replace_op(ret_op, jasp_ret, new_results=[])
-
-    # --- Promote @main body → jasp.quantum_kernel @main_kernel ---
+    # --- Move @main body into func.func private @main_kernel ---
+    # The body (including its func.return terminators) is moved as-is.
     region = main_op.detach_region(main_op.body)
-    kernel_op = QuantumKernelOp(
-        kernel_name="main_kernel",
-        function_type=new_ftype,
-        region=region,
-    )
+    kernel_func = FuncOp("main_kernel", old_ftype, region)
+    kernel_func.properties["sym_visibility"] = StringAttr("private")
 
     # --- Build new classical func.func @main wrapper ---
     new_block = Block(arg_types=classical_inputs)
@@ -291,30 +233,27 @@ def _lift_implicit_main_kernel(module: ModuleOp) -> None:
         Region([new_block]),
     )
 
-    # Replace old @main with the new classical wrapper; append the kernel
-    # (it will be moved into jasp.module by _collect_into_jasp_module).
+    # Replace old @main with the new classical wrapper; append the kernel.
     Rewriter.replace_op(main_op, new_main, new_results=[])
-    module_block.add_op(kernel_op)
+    module_block.add_op(kernel_func)
 
 
 def lift_quantum_kernels(module: ModuleOp) -> None:
     """
-    Walk all ``func.func`` ops in *module* and lift any that contain the
-    create/call/consume triplet into proper ``jasp.quantum_kernel`` ops.
+    Walk all ``func.func`` ops in *module* and replace any
+    create/call/consume sentinel triplets with ``jasp.call``.
+
+    The callee ``func.func`` is left unchanged — a quantum kernel is simply
+    a ``func.func`` whose last input/output is ``!jasp.QuantumState``.
 
     Mutates *module* in-place.
     """
     # Collect candidates first — we mutate the module body during the loop.
     func_ops = [op for op in module.body.ops if isinstance(op, FuncOp)]
 
-    # Build a symbol → FuncOp map for callee lookup.
-    symbol_table: dict[str, FuncOp] = {
-        op.sym_name.data: op for op in func_ops
-    }
-
-    # Track which FuncOps have been promoted to QuantumKernelOps already so we
-    # don't process the same callee more than once.
-    promoted: set[str] = set()
+    # Track which callees we've already seen so we don't process the same
+    # callee more than once.
+    processed: set[str] = set()
 
     for func_op in func_ops:
         pattern = _find_kernel_pattern(func_op)
@@ -322,74 +261,14 @@ def lift_quantum_kernels(module: ModuleOp) -> None:
             continue
 
         create_op, call_op, consume_op = pattern
-
         callee_name = call_op.callee.root_reference.data
-        if callee_name in promoted:
-            # Already lifted — just rewrite the call site.
-            _rewrite_call_site(create_op, call_op, consume_op)
-            continue
-
-        callee_func = symbol_table.get(callee_name)
-        if callee_func is None:
-            # Callee not found in this module — skip.
-            continue
-
-        # Promote the callee func.func → jasp.quantum_kernel.
-        kernel_op = _convert_callee(callee_func)
-
-        # Insert the new quantum_kernel op at the same position in the module.
-        Rewriter.replace_op(callee_func, kernel_op, new_results=[])
-        promoted.add(callee_name)
+        processed.add(callee_name)
 
         # Rewrite the call site: replace create + call + consume with jasp.call.
         _rewrite_call_site(create_op, call_op, consume_op)
 
     # Handle the implicit case: @main itself is a quantum kernel (no decorator).
     _lift_implicit_main_kernel(module)
-
-    # After all promotions, move every jasp.quantum_kernel into a jasp.module.
-    _collect_into_jasp_module(module)
-
-
-def _collect_into_jasp_module(module: ModuleOp) -> None:
-    """Move all jasp.quantum_kernel ops into a single jasp.module container.
-
-    Before::
-
-        builtin.module @jasp_module {
-          func.func @main(...) { ... jasp.call @my_kernel ... }
-          jasp.quantum_kernel @my_kernel(...) { ... }
-          ...
-        }
-
-    After::
-
-        builtin.module @jasp_module {
-          func.func @main(...) { ... jasp.call @my_kernel ... }
-          ...
-          jasp.module @qpu_module {
-            jasp.quantum_kernel @my_kernel(...) { ... }
-          }
-        }
-    """
-    module_block = module.body.blocks.first
-    if module_block is None:
-        return
-
-    kernel_ops = [op for op in module_block.ops if isinstance(op, QuantumKernelOp)]
-    if not kernel_ops:
-        return
-
-    # Detach kernels from builtin.module and collect them.
-    for op in kernel_ops:
-        module_block.detach_op(op)
-
-    # Build a new jasp.module containing all kernels.
-    qpu_block = Block()
-    for op in kernel_ops:
-        qpu_block.add_op(op)
-    jasp_mod = JaspModuleOp("qpu_module", Region([qpu_block]))
-    module_block.add_op(jasp_mod)
 
 
 def _rewrite_call_site(
