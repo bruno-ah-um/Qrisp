@@ -1,12 +1,13 @@
-# JASP Dialect: `jasp.quantum_kernel`
+# JASP Dialect: `jasp.call`
 
-Design notes and implementation reference for the `jasp.quantum_kernel` op.
+Design notes and implementation reference for the `jasp.call` op and the
+quantum kernel convention.
 
 ---
 
 ## Motivation
 
-Before this change, quantum functions were identified by sentinel ops:
+JAX lowering emits sentinel ops to bracket quantum computation:
 
 ```mlir
 func.func @main(...) {
@@ -16,10 +17,14 @@ func.func @main(...) {
 }
 ```
 
-To know whether a `func.func` is quantum, a tool had to scan the body for these
-sentinels. `jasp.quantum_kernel` makes quantum functions unambiguously
-identifiable from the op type alone — analogous to how `gpu.func` distinguishes
-GPU kernels from regular functions.
+The `lift_quantum_kernels` pass replaces this triplet with a single
+`jasp.call`, which presents a purely classical interface to the caller.
+The callee remains a regular `func.func` — it is identified as a quantum
+kernel by having `!jasp.QuantumState` as its last input and output.
+
+This follows the principle of reusing existing MLIR infrastructure
+(`func.func`, `func.return`) wherever possible, and only introducing new
+ops where semantically necessary.
 
 ---
 
@@ -30,23 +35,21 @@ After the full pipeline (`lift_quantum_kernels` + `hoist_classical_ops`):
 ```mlir
 // Classical host code — lives directly in builtin.module.
 // Post-measurement arithmetic has been hoisted here by hoist_classical_ops.
-func.func @main(%x: tensor<i64>, %qst: !jasp.QuantumState) -> (tensor<f64>, !jasp.QuantumState) {
+func.func @main(%x: tensor<i64>) -> tensor<f64> {
   %raw, %scale = jasp.call @my_kernel(%x) : (tensor<i64>) -> (tensor<i64>, tensor<f64>)
   %result = "stablehlo.convert"(%raw) : (tensor<i64>) -> tensor<f64>
   %scaled = "stablehlo.multiply"(%result, %scale) : (tensor<f64>, tensor<f64>) -> tensor<f64>
-  func.return %scaled, %qst : tensor<f64>, !jasp.QuantumState
+  func.return %scaled : tensor<f64>
 }
 
-// QPU code — all jasp.quantum_kernel ops live inside jasp.module.
+// Quantum kernel — a func.func identified by QuantumState in its signature.
 // Body contains only QPU-safe ops (jasp.* and stablehlo.constant).
-jasp.module @qpu_module {
-  jasp.quantum_kernel private @my_kernel(%x: tensor<i64>, %qst: !jasp.QuantumState) -> (tensor<i64>, tensor<f64>) {
-  ^bb0(%x: tensor<i64>, %qst: !jasp.QuantumState):
-    ...
-    %meas, %qst_out = jasp.measure %qubits, %qst_n : ...
-    %scale = "stablehlo.constant"() <{value = dense<1.0> : tensor<f64>}> : () -> tensor<f64>
-    jasp.return %meas, %scale, %qst_out : tensor<i64>, tensor<f64>, !jasp.QuantumState
-  }
+func.func private @my_kernel(%x: tensor<i64>, %qst: !jasp.QuantumState)
+    -> (tensor<i64>, tensor<f64>, !jasp.QuantumState) {
+  ...
+  %meas, %qst_out = jasp.measure %qubits, %qst_n : ...
+  %scale = "stablehlo.constant"() <{value = dense<1.0> : tensor<f64>}> : () -> tensor<f64>
+  func.return %meas, %scale, %qst_out : tensor<i64>, tensor<f64>, !jasp.QuantumState
 }
 ```
 
@@ -54,53 +57,24 @@ jasp.module @qpu_module {
 
 | Location | QuantumState |
 |---|---|
-| `jasp.quantum_kernel` declared `function_type` | absent (classical-only) |
-| Entry block arguments | present as the **last** block arg |
-| `jasp.return` operands | present as the **last** operand |
+| Quantum kernel `func.func` `function_type` | present as the **last** input and **last** output |
+| Quantum kernel `func.return` operands | present as the **last** operand |
 | `jasp.call` operands / results | absent (classical-only) |
 
-This matches the JAX lowering convention (QuantumState at the end).
+A quantum kernel is identified by checking whether the last input type of a
+`func.func` is `!jasp.QuantumState`.  This matches the JAX lowering convention.
 
 ---
 
-## New Ops
-
-### `jasp.module`
-
-Container for all `jasp.quantum_kernel` ops — analogous to `gpu.module`.
-
-- **Properties:** `sym_name`
-- **Region:** one region; single block containing `jasp.quantum_kernel` ops
-- **Traits:** `IsolatedFromAbove`, `SymbolOpInterface`
-- **Purpose:** structurally separates QPU code from classical host code; a downstream pass can walk `jasp.module` to find all quantum kernels without scanning the whole module.  `IsolatedFromAbove` causes the xDSL verifier to enforce that nothing inside `jasp.module` captures SSA values from the surrounding classical scope.
-
-### `jasp.quantum_kernel`
-
-Analogous to `func.func`. Declares a self-contained quantum function.
-
-- **Properties:** `sym_name`, `function_type` (classical-only), `sym_visibility`
-- **Region:** one region; entry block has `(<classical args..., !jasp.QuantumState>)` — QuantumState is the **last** block argument
-- **Traits:** `IsolatedFromAbove`, `SymbolOpInterface`
-- **Verify:**
-  - Parent op must be a `JaspModuleOp` (`HasParent` constraint)
-  - Entry block last arg must be `!jasp.QuantumState`
-  - Classical block args must match `function_type.inputs`
-  - `jasp.return` classical operands must match `function_type.outputs`
-
-### `jasp.return`
-
-Terminator for `jasp.quantum_kernel` bodies.
-
-- **Operands:** `(<classical results..., !jasp.QuantumState>)`
-- **Traits:** `IsTerminator`
-- **Assembly:** `jasp.return %res, %qst : tensor<f64>, !jasp.QuantumState`
+## New Op
 
 ### `jasp.call`
 
-Calls a `jasp.quantum_kernel` by symbol. Purely classical from the caller's view.
+Calls a quantum kernel (`func.func` with QuantumState in its signature) by
+symbol.  Purely classical from the caller's view.
 
 - **Properties:** `callee` (flat symbol ref)
-- **Operands/Results:** classical types only — QuantumState lifecycle managed by the kernel boundary
+- **Operands/Results:** classical types only — QuantumState lifecycle managed at the call boundary
 - **Assembly:** `jasp.call @name(%args) : (input_types) -> (result_types)`
 
 ---
@@ -109,51 +83,49 @@ Calls a `jasp.quantum_kernel` by symbol. Purely classical from the caller's view
 
 | File | Role |
 |---|---|
-| `src/qrisp/jasp/mlir/xdsl_dialect.py` | xDSL op definitions (`JaspModuleOp`, `QuantumKernelOp`, `JaspReturnOp`, `JaspCallOp`) and verifiers |
-| `src/qrisp/jasp/mlir/lift_quantum_kernels.py` | xDSL pass: rewrites sentinel pattern into new ops, then collects kernels into `jasp.module` |
-| `src/qrisp/jasp/mlir/hoist_classical_ops.py` | xDSL pass: moves non-QPU-safe ops out of `jasp.quantum_kernel` into `@main` |
-| `src/qrisp/jasp/mlir/drop_dead_wrappers.py` | xDSL pass: erases uncalled `private` `func.func` shadow wrappers emitted by JAX |
+| `src/qrisp/jasp/mlir/xdsl_dialect.py` | xDSL op definition (`JaspCallOp`) and JASP dialect types |
+| `src/qrisp/jasp/mlir/lift_quantum_kernels.py` | xDSL pass: replaces sentinel triplet with `jasp.call`; callee `func.func` is left unchanged |
+| `src/qrisp/jasp/mlir/hoist_classical_ops.py` | xDSL pass: moves non-QPU-safe ops out of quantum kernel `func.func` into `@main` |
+| `src/qrisp/jasp/mlir/drop_dead_wrappers.py` | xDSL pass: erases uncalled `private` `func.func` wrappers emitted by JAX |
 | `src/qrisp/jasp/mlir/mlir_emission.py` | Pipeline: `fix_quantum_control_flow` → `lift_quantum_kernels` → `hoist_classical_ops` → `drop_dead_wrappers` |
 | `src/qrisp/jasp/mlir/dialect_definition/JaspOps.td` | TableGen definitions for C++ MLIR / `mlir-opt` validation |
-| `tests/jax_tests/test_mlir.py` | `test_mlir_quantum_kernel_lifting` verifies the promotion |
+| `tests/jax_tests/test_mlir.py` | `test_mlir_quantum_kernel_lifting` verifies the transformation |
 
 ### Pass: `lift_quantum_kernels`
 
-Runs after `fix_quantum_control_flow`. Two phases:
-
-**Phase 1 — sentinel promotion.** For each `func.func` in the module, look for the triplet:
+Runs after `fix_quantum_control_flow`.  For each `func.func` in the module,
+looks for the sentinel triplet:
 
 1. `%qst = jasp.create_quantum_kernel`
 2. `func.call @callee(..., %qst)` — QuantumState last operand/result
 3. `jasp.consume_quantum_kernel %qst_out`
 
-Then:
-- Converts `@callee` (`func.func`) → `jasp.quantum_kernel`: strips QuantumState
-  from the declared `function_type`, rewrites `func.return` → `jasp.return`
-- Replaces the triplet with `jasp.call @callee(<classical args>)`
+Then replaces the triplet with `jasp.call @callee(<classical args>)`.  The
+callee `func.func` is **not** modified — it keeps QuantumState in its
+signature and uses `func.return`.
 
-**Phase 2 — module collection.** After all promotions, detaches every
-`jasp.quantum_kernel` from `builtin.module` and moves it into a new
-`jasp.module @qpu_module` appended at the end of `builtin.module`.
+For programs without an explicit `@quantum_kernel` decorator (i.e. `@main`
+itself contains quantum ops), the pass extracts `@main`'s body into a new
+`func.func private @main_kernel` and inserts a `jasp.call` wrapper.
 
-JAX-level tracing (`create_quantum_kernel_p`, `consume_quantum_kernel_p` primitives
-and the `quantum_kernel` Python decorator) is unchanged — the transformation is
-purely at the xDSL post-processing stage.
+JAX-level tracing (`create_quantum_kernel_p`, `consume_quantum_kernel_p`
+primitives and the `quantum_kernel` Python decorator) is unchanged — the
+transformation is purely at the xDSL post-processing stage.
 
 ### Pass: `hoist_classical_ops`
 
 Runs after `lift_quantum_kernels`. Moves classical (non-QPU-safe) ops out of
-every `jasp.quantum_kernel` body and into `@main`, where they execute on the CPU
-host after the quantum kernel returns.
+every quantum kernel `func.func` body and into `@main`, where they execute
+on the CPU host after the quantum kernel returns.
 
 **Why it is needed.** After `lift_quantum_kernels` the kernel bodies may still
 contain classical `stablehlo` arithmetic that JAX inlined from post-measurement
 post-processing (type conversions, scaling, etc.). A real QPU backend (QIR,
 OpenQASM) cannot execute these ops, so they must live in the classical host.
 
-**QPU-safe allowlist.** An op may remain inside `jasp.quantum_kernel` if its
-name starts with `"jasp."` or it is `stablehlo.constant` (used for qubit counts
-and gate angles). Everything else is hoisted.
+**QPU-safe allowlist.** An op may remain inside a quantum kernel if its
+name starts with `"jasp."`, it is `stablehlo.constant` (used for qubit counts
+and gate angles), or it is `func.return`. Everything else is hoisted.
 
 > **xDSL note.** Unregistered ops (all `stablehlo.*`) have `op.name ==
 > "builtin.unregistered"`. Their actual op name is in `op.op_name.data` with
@@ -165,7 +137,7 @@ and gate angles). Everything else is hoisted.
 2. Collect `extra_kernel_deps`: values produced by allowlisted kernel ops (or
    block args) that `to_hoist` ops consume — these must cross the kernel
    boundary as extra return values.
-3. Rebuild `jasp.return`: replace hoisted classical results with
+3. Rebuild `func.return`: replace hoisted classical results with
    `extra_kernel_deps`, update `function_type.outputs`.
 4. Insert a new `jasp.call` with updated result types.
 5. Detach `to_hoist` ops from the kernel, fix their operands using a
@@ -177,14 +149,14 @@ and gate angles). Everything else is hoisted.
 
 ```mlir
 // Before
-jasp.quantum_kernel @k(%arg: tensor<i64>) -> tensor<f64> {
-^bb0(%arg: tensor<i64>, %qst: !jasp.QuantumState):
+func.func private @k(%arg: tensor<i64>, %qst: !jasp.QuantumState)
+    -> (tensor<f64>, !jasp.QuantumState) {
   ...
   %8, %9 = jasp.measure %qubits, %qst5 : ...
   %10 = "stablehlo.constant"() <{value = dense<1.0> : tensor<f64>}> : () -> tensor<f64>
   %11 = "stablehlo.convert"(%8) : (tensor<i64>) -> tensor<f64>
   %12 = "stablehlo.multiply"(%11, %10) : (tensor<f64>, tensor<f64>) -> tensor<f64>
-  jasp.return %12, %9 : tensor<f64>, !jasp.QuantumState
+  func.return %12, %9 : tensor<f64>, !jasp.QuantumState
 }
 
 // After
@@ -194,12 +166,12 @@ func.func @main(...) {
   %12 = "stablehlo.multiply"(%11, %scale) : (tensor<f64>, tensor<f64>) -> tensor<f64>
   ...
 }
-jasp.quantum_kernel @k(%arg: tensor<i64>) -> (tensor<i64>, tensor<f64>) {
-^bb0(%arg: tensor<i64>, %qst: !jasp.QuantumState):
+func.func private @k(%arg: tensor<i64>, %qst: !jasp.QuantumState)
+    -> (tensor<i64>, tensor<f64>, !jasp.QuantumState) {
   ...
   %8, %9 = jasp.measure %qubits, %qst5 : ...
   %10 = "stablehlo.constant"() <{value = dense<1.0> : tensor<f64>}> : () -> tensor<f64>
-  jasp.return %8, %10, %9 : tensor<i64>, tensor<f64>, !jasp.QuantumState
+  func.return %8, %10, %9 : tensor<i64>, tensor<f64>, !jasp.QuantumState
 }
 ```
 
@@ -222,10 +194,9 @@ is threaded back to `@main` as an extra return value.
   op list. `scf.if` / `scf.while` ops that contain `jasp.*` ops inside their
   regions are not in the QPU-safe allowlist, so the pass would attempt to hoist
   them — silently producing invalid IR. In practice the IR produced by the
-  current JAX tracing never places `scf.*` directly inside a
-  `jasp.quantum_kernel` entry block (quantum control flow is handled before
-  `lift_quantum_kernels`), but this is not enforced and should be guarded
-  explicitly in a future revision.
+  current JAX tracing never places `scf.*` directly inside a quantum kernel
+  entry block (quantum control flow is handled before `lift_quantum_kernels`),
+  but this is not enforced and should be guarded explicitly in a future revision.
 
 ### Pass: `drop_dead_wrappers`
 
@@ -248,42 +219,29 @@ never called — they are dead code that bloats the IR.
 
 ## Design Decisions
 
-**No nesting.** A `jasp.quantum_kernel` cannot contain another
-`jasp.quantum_kernel`. Enforced by convention; no verifier check for this yet.
+**Reuse `func.func` and `func.return`.** Rather than introducing custom
+`jasp.quantum_kernel` and `jasp.return` ops, quantum kernels are plain
+`func.func` ops. A quantum kernel is identified by checking whether its
+signature contains `!jasp.QuantumState`. This follows the MLIR principle of
+reusing existing dialect infrastructure and avoids the maintenance cost of
+additional ops that every pass would need to handle.
+
+**Only `jasp.call` is new.** `jasp.call` is the one genuinely new op: it
+presents a classical-only call interface, hiding the QuantumState lifecycle
+from the caller. `func.call` cannot serve this role because its operands/results
+must match the callee's `function_type`, which includes QuantumState.
 
 **QuantumState last, not first.** JAX's lowering puts QuantumState as the last
-argument/result throughout. The new ops follow the same convention so the block
-arg layout of a promoted callee is identical to the original `func.func`.
+argument/result throughout. The convention is preserved so that the block arg
+layout of a quantum kernel is identical to the `func.func` emitted by JAX.
 
 **`jasp.call` is classical-only.** External consumers (QIR backends, schedulers)
 see a clean classical interface. The quantum state lifecycle is an internal detail
-of the kernel, inferred from the op type (`jasp.quantum_kernel`) rather than
-explicit operands.
+of the kernel, inferred from the callee's signature rather than explicit operands.
 
 **Shadow wrapper functions are removed.** JAX emits thin `func.func` wrappers
 (e.g. `@jasp.create_qubits`, `@jasp.measure`) for every primitive it encounters.
 Our lowering rules emit JASP ops inline rather than via `func.call`, so these
 wrappers are never called. The `drop_dead_wrappers` pass (run last in the
 pipeline) erases all `private` `func.func` ops with no callers, leaving only
-`@main` in `builtin.module`.
-
----
-
-## Reference: GPU Dialect Analogy
-
-| `gpu` dialect | `jasp` dialect |
-|---|---|
-| `gpu.module` | `jasp.module` |
-| `gpu.func` | `jasp.quantum_kernel` |
-| `gpu.return` | `jasp.return` |
-| `gpu.launch_func` | `jasp.call` |
-| implicit thread/block index args in body | implicit `!jasp.QuantumState` arg in body |
-
-**Note:** in the GPU dialect, `gpu.func` has a `HasParent<GPUModuleOp>` constraint
-and cannot appear outside `gpu.module`. The same structural rule applies here:
-`jasp.quantum_kernel` ops are always collected into `jasp.module` by the
-`lift_quantum_kernels` pass, and the `HasParent` constraint is enforced by
-`QuantumKernelOp.verify_()` in xDSL.
-
-MLIR `gpu.func` source: `mlir/lib/Dialect/GPU/IR/GPUDialect.cpp`
-MLIR GPU dialect docs: https://mlir.llvm.org/docs/Dialects/GPU/
+`@main` and quantum kernel functions in `builtin.module`.
