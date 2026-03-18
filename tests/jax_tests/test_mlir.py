@@ -483,8 +483,9 @@ def test_mlir_jasp_dialect_registration():
 
 def test_mlir_quantum_kernel_lifting():
     """
-    Test that the quantum_kernel decorator produces a jasp.quantum_kernel op
-    and a jasp.call at the call site, replacing the create/consume sentinel pair.
+    Test that the quantum_kernel decorator produces a jasp.call at the call
+    site, replacing the create/consume sentinel pair.  The callee stays as a
+    func.func with !jasp.QuantumState in its signature.
     """
     from qrisp import QuantumFloat, measure
     from qrisp.jasp import make_jaspr, quantum_kernel
@@ -502,44 +503,34 @@ def test_mlir_quantum_kernel_lifting():
     xdsl_module = jaspr_to_mlir(jaspr)
     mlir_str = str(xdsl_module)
 
-    # All quantum kernels must be collected inside a jasp.module container.
-    assert "jasp.module" in mlir_str, \
-        "Expected jasp.module container in MLIR output"
-
-    # The callee must be promoted to jasp.quantum_kernel inside jasp.module.
-    assert "jasp.quantum_kernel" in mlir_str, \
-        "Expected jasp.quantum_kernel op in MLIR output"
-
     # The call site must be a jasp.call (purely classical).
     assert "jasp.call" in mlir_str, \
         "Expected jasp.call op in MLIR output"
 
-    # The body terminator must be jasp.return.
-    assert "jasp.return" in mlir_str, \
-        "Expected jasp.return in quantum kernel body"
+    # The callee stays as a func.func (no jasp.quantum_kernel or jasp.module).
+    assert "jasp.quantum_kernel" not in mlir_str, \
+        "jasp.quantum_kernel should not appear — quantum kernels are func.func"
+    assert "jasp.module" not in mlir_str, \
+        "jasp.module should not appear — no container needed"
+    assert "jasp.return" not in mlir_str, \
+        "jasp.return should not appear — kernel uses func.return"
 
-    # The user-written quantum kernel should be promoted to jasp.quantum_kernel
-    # inside the jasp.module container.
-    assert "jasp.quantum_kernel @inner" in mlir_str or \
-           "jasp.quantum_kernel private @inner" in mlir_str, \
-        "Expected user quantum kernel to be promoted to jasp.quantum_kernel"
-
-    # jasp.quantum_kernel must be inside jasp.module, not at the top level.
-    from qrisp.jasp.mlir.xdsl_dialect import JaspModuleOp, QuantumKernelOp
-    from xdsl.dialects import func as func_dialect
+    # The quantum kernel must be a func.func with QuantumState in its signature.
+    from qrisp.jasp.mlir.xdsl_dialect import QuantumStateType
+    from xdsl.dialects.func import FuncOp
     top_level_ops = list(xdsl_module.body.blocks[0].ops)
-    assert not any(isinstance(op, QuantumKernelOp) for op in top_level_ops), \
-        "jasp.quantum_kernel should be inside jasp.module, not at top level"
-    jasp_mod = next((op for op in top_level_ops if isinstance(op, JaspModuleOp)), None)
-    assert jasp_mod is not None, "Expected a jasp.module op at top level"
-    kernel_names = {op.sym_name.data for op in jasp_mod.body.blocks[0].ops
-                    if isinstance(op, QuantumKernelOp)}
+    quantum_kernels = [
+        op for op in top_level_ops
+        if isinstance(op, FuncOp)
+        and list(op.function_type.inputs)
+        and isinstance(list(op.function_type.inputs)[-1], QuantumStateType)
+    ]
+    kernel_names = {op.sym_name.data for op in quantum_kernels}
     assert "inner" in kernel_names, \
-        f"Expected 'inner' kernel inside jasp.module, found: {kernel_names}"
+        f"Expected 'inner' quantum kernel func.func, found: {kernel_names}"
 
     # The call site must NOT thread QuantumState explicitly.
     # A jasp.call line should only carry classical types.
-    import re
     call_lines = [l for l in mlir_str.splitlines() if "jasp.call" in l]
     for line in call_lines:
         assert "QuantumState" not in line, \
@@ -846,17 +837,12 @@ def test_mlir_opt_roundtrip_parity():
 
 def test_mlir_opt_roundtrip_quantum_kernel():
     """
-    Test that the xDSL output containing jasp.module / jasp.quantum_kernel /
-    jasp.call / jasp.return is syntactically valid C++ MLIR.
+    Test that the xDSL output containing jasp.call and quantum kernel
+    func.func ops is syntactically valid C++ MLIR.
 
     Unlike the other roundtrip tests (which validate the pre-xDSL JAX MLIR),
     this test runs the *full* pipeline — including lift_quantum_kernels and
     drop_dead_wrappers — and then validates the resulting xDSL module.
-
-    Because jasp.quantum_kernel uses a custom assembly format in xDSL, the
-    module is serialised in generic MLIR form before being handed to mlir-opt,
-    so the test works in syntax-only mode (--allow-unregistered-dialect)
-    without needing the compiled dialect plugin.
     """
     import os
     import shutil
@@ -890,12 +876,10 @@ def test_mlir_opt_roundtrip_quantum_kernel():
     jaspr = make_jaspr(main)(jnp.int64(1))
     xdsl_module = jaspr_to_mlir(jaspr)
 
-    # Verify the new ops are present in the xDSL output.
+    # Verify expected ops are present in the xDSL output.
     mlir_str = str(xdsl_module)
-    assert "jasp.module" in mlir_str, "Expected jasp.module in xDSL output"
-    assert "jasp.quantum_kernel" in mlir_str, "Expected jasp.quantum_kernel in xDSL output"
     assert "jasp.call" in mlir_str, "Expected jasp.call in xDSL output"
-    assert "jasp.return" in mlir_str, "Expected jasp.return in xDSL output"
+    assert "func.func" in mlir_str, "Expected func.func in xDSL output"
 
     # Serialise in generic form so mlir-opt can parse it without the custom
     # assembly format implementation (--allow-unregistered-dialect).
