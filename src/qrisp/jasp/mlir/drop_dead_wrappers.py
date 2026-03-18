@@ -32,13 +32,19 @@ This pass removes them, leaving only functions that are actually called.
 from xdsl.dialects.builtin import ModuleOp
 from xdsl.dialects.func import CallOp, FuncOp
 
+from qrisp.jasp.mlir.xdsl_dialect import JaspCallOp
+
 
 def _collect_called_symbols(module: ModuleOp) -> set[str]:
-    """Return the set of symbol names referenced by any func.call in the module."""
+    """Return the set of symbol names referenced by any call in the module.
+
+    Checks both ``func.call`` and ``jasp.call`` — the latter is used to
+    invoke quantum kernel ``func.func`` ops.
+    """
     called: set[str] = set()
     for block in module.body.blocks:
         for op in block.walk():
-            if isinstance(op, CallOp):
+            if isinstance(op, (CallOp, JaspCallOp)):
                 called.add(op.callee.root_reference.data)
     return called
 
