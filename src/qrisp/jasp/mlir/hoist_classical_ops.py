@@ -61,7 +61,7 @@ QPU-safe allowlist
 Everything else is hoisted.
 """
 
-from xdsl.dialects.builtin import FunctionType, ModuleOp
+from xdsl.dialects.builtin import ArrayAttr, DictionaryAttr, FunctionType, ModuleOp
 from xdsl.dialects.func import FuncOp, ReturnOp
 from xdsl.rewriter import InsertPoint, Rewriter
 
@@ -172,10 +172,18 @@ def _hoist_from_kernel(
     new_ret = ReturnOp(*list(new_classical_returns + [qst_return]))
     Rewriter.replace_op(func_return, new_ret, new_results=[])
 
+    new_outputs = new_result_types + [QuantumStateType()]
     kernel_func.properties["function_type"] = FunctionType.from_lists(
         list(kernel_func.function_type.inputs),
-        new_result_types + [QuantumStateType()],
+        new_outputs,
     )
+
+    # Keep res_attrs in sync with the new result count (func.func verifier
+    # requires res_attrs length == number of results when the attr is present).
+    if "res_attrs" in kernel_func.properties:
+        kernel_func.properties["res_attrs"] = ArrayAttr(
+            [DictionaryAttr({})] * len(new_outputs)
+        )
 
     # ------------------------------------------------------------------
     # Build new jasp.call with updated result types and insert after old one.
