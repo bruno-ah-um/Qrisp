@@ -1132,6 +1132,26 @@ class Jaspr(ClosedJaxpr):
 
         return jaspr_to_mlir(self)
 
+    def to_cpp(self):
+        """
+        Compiles the Jaspr to C++ source code via the EmitC dialect.
+
+        The classical host code is lowered to EmitC and translated to C++
+        using ``mlir-translate --mlir-to-cpp``.  Quantum kernel calls are
+        replaced with ``run_jasp_kernel(...)`` calls that receive the kernel's
+        JASP MLIR as a C raw string literal — suitable for submission via QDMI.
+
+        Requires ``mlir-translate`` (from the MLIR toolchain) on the PATH.
+
+        Returns
+        -------
+        str
+            The C++ source code as a string.
+        """
+        from qrisp.jasp.mlir.cpp_emission import jaspr_to_cpp
+
+        return jaspr_to_cpp(self)
+
     def to_catalyst_mlir(self):
         """
         Compiles the Jaspr to MLIR using the `Catalyst dialect <https://docs.pennylane.ai/projects/catalyst/en/stable/index.html>`__.
