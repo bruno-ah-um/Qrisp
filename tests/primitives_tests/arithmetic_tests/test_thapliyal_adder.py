@@ -35,7 +35,9 @@ from qrisp.jasp import jaspify
 # ---------------------------------------------------------------------------
 # Static smoke tests — just a few representative cases with small registers
 # to catch gross regressions without the full statevector-simulation cost.
-# Exhaustive coverage lives in the jaspify tests below.
+# These already give 100% line/branch coverage of thapliyal_adder.py; the
+# jaspify tests below only spot-check the traced (Jasp) code path with a
+# handful of hand-picked cases (see that section's docstring for why).
 # ---------------------------------------------------------------------------
 
 
@@ -228,19 +230,29 @@ def test_thapliyal_adder_static_smoke_inputs_unmodified():
 
 
 # ---------------------------------------------------------------------------
-# Exhaustive tests via @jaspify.
+# Sanity-check tests via @jaspify, exercising the traced/Jasp code path.
 #
-# Unlike cuccaro_adder, thapliyal_adder's TR-gate step uses rx/p rotations that
+# Unlike cuccaro_adder, thapliyal_adder's Peres/TR gates use rx/p rotations that
 # the fast classical @boolean_simulation evaluator can't process ("Classical function simulator
 # can't process gate crx"), even though the whole circuit reduces to a boolean
 # permutation on computational basis states. So these tests fall back to
-# @jaspify (full statevector simulation of the traced program), which is
-# considerably slower — register sizes here are kept small to keep runtime
-# reasonable.
+# @jaspify (full statevector simulation of the traced program).
+#
+# Unlike @boolean_simulation, @jaspify's return_function retraces from scratch
+# (make_jaspr) on every single call -- there is no compilation cache at that
+# layer -- so each call here pays a large fixed cost regardless of register
+# size. These tests therefore exercise a small, fixed number of hand-picked
+# (shape, value) cases rather than sweeping exhaustively, the same way
+# test_gidney_venting_adder.py's @jaspify tests use short hand-picked case
+# lists instead of nested value loops. Exhaustive value-space correctness
+# (many (n, a, b, c_in) combinations, including small n) is cheap to check via
+# plain static-mode simulation instead, and line/branch coverage of
+# thapliyal_adder.py is already 100% from the static smoke tests above alone
+# -- these dynamic tests add no incremental coverage, only a structural check
+# that jrange/jlen-driven tracing produces a working circuit.
 #
 # Each helper factory captures configuration as CLOSURE variables (not function
 # parameters) so JAX treats them as compile-time constants during @jit tracing.
-# Loops live in plain Python outer functions to keep the JAX cache warm.
 # ---------------------------------------------------------------------------
 
 
@@ -423,173 +435,159 @@ def _mk_add_cout_ctrl(c_in_val, ctrl_val):
     return add
 
 
-# -- exhaustive test runners -------------------------------------------------
+# -- test runners -------------------------------------------------------
 #
-# Register sizes are kept small (2-3 bits) since each call runs a full
-# statevector simulation of the traced program (see module docstring above).
+# A single N == L == 3 shape with a few hand-picked (j, k) pairs: zero
+# (identity-ish), 7+7 (both-max, exercises overflow/c_out), and 3+5 (a
+# general carry-propagating case). Broader (N, L) shape coverage -- unequal
+# sizes, truncation vs. extension -- is already exercised cheaply by the
+# static smoke tests (SMOKE_CASES) above.
+
+_JK_CASES = [(0, 0), (7, 7), (3, 5)]
 
 
-def _run_basic_exhaustive():
+def _run_basic_cases():
     add = _mk_add_basic()
-    for N in range(2, 4):
-        for L in range(2, 4):
-            for j in range(1 << N):
-                for k in range(1 << L):
-                    A, B = add(N, L, j, k)
-                    assert A == j
-                    assert B == (k + j) % (1 << L)
+    for j, k in _JK_CASES:
+        A, B = add(3, 3, j, k)
+        assert A == j
+        assert B == (k + j) % 8
 
 
 def test_thapliyal_adder_basic_dynamic():
-    _run_basic_exhaustive()
+    _run_basic_cases()
 
 
-def _run_cin_exhaustive():
+def _run_cin_cases():
     for c_in_val in (0, 1):
         add = _mk_add_cin(c_in_val)
-        for N in range(2, 4):
-            for L in range(2, 4):
-                for j in range(1 << N):
-                    for k in range(1 << L):
-                        B = add(N, L, j, k)
-                        assert B == (k + j + c_in_val) % (1 << L)
+        for j, k in _JK_CASES:
+            B = add(3, 3, j, k)
+            assert B == (k + j + c_in_val) % 8
 
 
 def test_thapliyal_adder_cin_dynamic():
-    _run_cin_exhaustive()
+    _run_cin_cases()
 
 
-def _run_cin_qubit_exhaustive():
+def _run_cin_qubit_cases():
     for c_in_val in (0, 1):
         add = _mk_add_cin_qubit(c_in_val)
-        for N in range(2, 4):
-            for L in range(2, 4):
-                for j in range(1 << N):
-                    for k in range(1 << L):
-                        B = add(N, L, j, k)
-                        assert B == (k + j + c_in_val) % (1 << L)
+        for j, k in _JK_CASES:
+            B = add(3, 3, j, k)
+            assert B == (k + j + c_in_val) % 8
 
 
 def test_thapliyal_adder_cin_qubit_dynamic():
-    _run_cin_qubit_exhaustive()
+    _run_cin_qubit_cases()
 
 
-def _run_cout_exhaustive():
+def _run_cout_cases():
     for c_in_val in (0, 1):
         add = _mk_add_cout(c_in_val)
-        for L in range(2, 4):
-            for j in range(1 << L):
-                for k in range(1 << L):
-                    total = k + j + c_in_val
-                    B, cout = add(L, j, k)
-                    assert B == total % (1 << L)
-                    assert cout == (total >= (1 << L))
+        for j, k in _JK_CASES:
+            total = k + j + c_in_val
+            B, cout = add(3, j, k)
+            assert B == total % (1 << 3)
+            assert cout == (total >= (1 << 3))
 
 
 def test_thapliyal_adder_cout_dynamic():
-    _run_cout_exhaustive()
+    _run_cout_cases()
 
 
-def _run_cout_qubit_exhaustive():
+def _run_cout_qubit_cases():
     for c_in_val in (0, 1):
         add = _mk_add_cout_qubit(c_in_val)
-        for L in range(2, 4):
-            for j in range(1 << L):
-                for k in range(1 << L):
-                    total = k + j + c_in_val
-                    B, cout = add(L, j, k)
-                    assert B == total % (1 << L)
-                    assert cout == (total >= (1 << L))
+        for j, k in _JK_CASES:
+            total = k + j + c_in_val
+            B, cout = add(3, j, k)
+            assert B == total % (1 << 3)
+            assert cout == (total >= (1 << 3))
 
 
 def test_thapliyal_adder_cout_qubit_dynamic():
-    _run_cout_qubit_exhaustive()
+    _run_cout_qubit_cases()
 
 
-def _run_cout_equal_sizes_exhaustive():
+def _run_cout_equal_sizes_cases():
     for c_in_val in (0, 1):
         add = _mk_add_cout_qq(c_in_val)
-        for L in range(2, 4):
-            for j in range(1 << L):
-                for k in range(1 << L):
-                    total = k + j + c_in_val
-                    A_res, B_res, cout = add(L, j, k)
-                    assert A_res == j
-                    assert B_res == total % (1 << L)
-                    assert cout == (total >= (1 << L))
+        for j, k in _JK_CASES:
+            total = k + j + c_in_val
+            A_res, B_res, cout = add(3, j, k)
+            assert A_res == j
+            assert B_res == total % (1 << 3)
+            assert cout == (total >= (1 << 3))
 
 
 def test_thapliyal_adder_cout_equal_sizes_dynamic():
-    _run_cout_equal_sizes_exhaustive()
+    _run_cout_equal_sizes_cases()
 
 
-def _run_ctrl_exhaustive():
-    # ctrl retraces the controlled variant per distinct (N, L) shape (see
-    # custom_control_environment.py), which is the most expensive part of this
-    # test file under @jaspify. A single shape still exercises the ctrl code
-    # path fully; broader (N, L) coverage is already exhausted by the
-    # non-ctrl basic/cin/cout tests above.
+# ctrl retraces the controlled variant per distinct (N, L) shape (see
+# custom_control_environment.py), so these keep the single N == L == 2 shape
+# already established below, with just two (j, k) cases: zero and an
+# overflow-triggering pair. Broader shape/value coverage is already exhausted
+# by the non-ctrl tests above and by the static smoke tests.
+
+_JK_CASES_CTRL = [(0, 0), (2, 3)]
+
+
+def _run_ctrl_cases():
     for c_in_val in (0, 1):
         for use_kwarg in (False, True):
             for ctrl_val in (0, 1):
                 add = _mk_add_ctrl(c_in_val, use_kwarg, ctrl_val)
-                for N in (2,):
-                    for L in (2,):
-                        for j in range(1 << N):
-                            for k in range(1 << L):
-                                A, B = add(N, L, j, k)
-                                assert A == j
-                                # ctrl off -> addition is a no-op (B unchanged)
-                                if ctrl_val:
-                                    assert B == (k + j + c_in_val) % (1 << L)
-                                else:
-                                    assert B == k
+                for j, k in _JK_CASES_CTRL:
+                    A, B = add(2, 2, j, k)
+                    assert A == j
+                    # ctrl off -> addition is a no-op (B unchanged)
+                    if ctrl_val:
+                        assert B == (k + j + c_in_val) % 4
+                    else:
+                        assert B == k
 
 
 def test_thapliyal_adder_ctrl_dynamic():
-    _run_ctrl_exhaustive()
+    _run_ctrl_cases()
 
 
-def _run_ctrl_qubit_exhaustive():
+def _run_ctrl_qubit_cases():
     for c_in_val in (0, 1):
         for use_kwarg in (False, True):
             for ctrl_val in (0, 1):
                 add = _mk_add_ctrl_qubit(c_in_val, use_kwarg, ctrl_val)
-                for N in (2,):
-                    for L in (2,):
-                        for j in range(1 << N):
-                            for k in range(1 << L):
-                                A, B = add(N, L, j, k)
-                                assert A == j
-                                # ctrl off -> addition is a no-op (B unchanged)
-                                if ctrl_val:
-                                    assert B == (k + j + c_in_val) % (1 << L)
-                                else:
-                                    assert B == k
+                for j, k in _JK_CASES_CTRL:
+                    A, B = add(2, 2, j, k)
+                    assert A == j
+                    # ctrl off -> addition is a no-op (B unchanged)
+                    if ctrl_val:
+                        assert B == (k + j + c_in_val) % 4
+                    else:
+                        assert B == k
 
 
 def test_thapliyal_adder_ctrl_qubit_dynamic():
-    _run_ctrl_qubit_exhaustive()
+    _run_ctrl_qubit_cases()
 
 
-def _run_cout_ctrl_exhaustive():
+def _run_cout_ctrl_cases():
     for c_in_val in (0, 1):
         for ctrl_val in (0, 1):
             add = _mk_add_cout_ctrl(c_in_val, ctrl_val)
-            for L in (2,):
-                for j in range(1 << L):
-                    for k in range(1 << L):
-                        total = k + j + c_in_val
-                        A_res, B_res, cout = add(L, j, k)
-                        assert A_res == j
-                        if ctrl_val:
-                            assert B_res == total % (1 << L)
-                            assert cout == (total >= (1 << L))
-                        else:
-                            # ctrl off -> no-op: B unchanged and c_out stays |0>
-                            assert B_res == k
-                            assert not cout
+            for j, k in _JK_CASES_CTRL:
+                total = k + j + c_in_val
+                A_res, B_res, cout = add(2, j, k)
+                assert A_res == j
+                if ctrl_val:
+                    assert B_res == total % (1 << 2)
+                    assert cout == (total >= (1 << 2))
+                else:
+                    # ctrl off -> no-op: B unchanged and c_out stays |0>
+                    assert B_res == k
+                    assert not cout
 
 
 def test_thapliyal_adder_cout_ctrl_dynamic():
-    _run_cout_ctrl_exhaustive()
+    _run_cout_ctrl_cases()

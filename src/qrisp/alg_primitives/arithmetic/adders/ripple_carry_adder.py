@@ -121,7 +121,7 @@ def inpl_add(
     min_sig = min(signficance_range_intersetion)
 
     # If the maximum significance is higher than the maximum signficance of qf2, we need
-    # to augment some ancilla qubits because the Cuccaro-procedure requires equal
+    # to augment some ancilla qubits because the adder requires equal
     # amount of input qubits
 
     from qrisp.core import QuantumVariable
@@ -133,7 +133,7 @@ def inpl_add(
     else:
         augmented_qf2_qbs = qf2.reg
 
-    # Determine the bit window of which bits should participate in the Cuccaro-procedure
+    # Determine the bit window of which bits should participate in the addition
     bit_window_1 = [
         significance_range_qf1.index(min_sig),
         significance_range_qf1.index(max_sig),
