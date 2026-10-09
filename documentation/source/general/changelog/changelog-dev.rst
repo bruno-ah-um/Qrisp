@@ -10,6 +10,15 @@ changelog enforcement.
 New Features
 ------------
 
+- **T-depth estimation for Jasp programs**
+  The new :func:`~qrisp.jasp.t_depth` decorator (and :meth:`Jaspr.t_depth
+  <qrisp.jasp.Jaspr.t_depth>`) computes the T-depth of a Jasp program alongside
+  :func:`~qrisp.jasp.depth`, :func:`~qrisp.jasp.count_ops` and
+  :func:`~qrisp.jasp.num_qubits`. By default, gates are costed by
+  :func:`~qrisp.t_depth_indicator`, as in ``QuantumCircuit.t_depth``. Rotations
+  that are neither Clifford nor T gates can be costed with a custom
+  ``depth_indicator``.
+
 - **sample() and expectation_value() now accept arbitrary return values**
   Sampling kernels (the functions passed to :func:`~qrisp.jasp.sample` and
   :func:`~qrisp.jasp.expectation_value`) may now return classical values

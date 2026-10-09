@@ -89,6 +89,11 @@ METRIC_DISPATCH = {
         extract_metric=extract_depth,
         simulate_fallback=simulate_depth,
     ),
+    "t_depth": MetricSpec(
+        build_profiler=get_depth_profiler,
+        extract_metric=extract_depth,
+        simulate_fallback=simulate_depth,
+    ),
     "num_qubits": MetricSpec(
         build_profiler=get_num_qubits_profiler,
         extract_metric=extract_num_qubits,
@@ -445,6 +450,211 @@ def depth(
     return depth_decorator
 
 
+def t_depth(
+    meas_behavior: str | Callable,
+    max_qubits: int = 1024,
+    callback_threshold: int | None = None,
+    depth_indicator: Callable | None = None,
+) -> Callable:
+    r"""Decorator to determine the T-depth of large scale quantum computations.
+
+    This decorator compiles the given Jasp-compatible function into a classical
+    function computing the T-depth required. The decorated function returns
+    an integer indicating the T-depth of the quantum computation, i.e. the number
+    of sequential layers of T gates (Clifford gates are free).
+
+    The T-depth of each gate is determined by ``depth_indicator``, which defaults
+    to :func:`~qrisp.t_depth_indicator`, the same function used by
+    :meth:`QuantumCircuit.t_depth <qrisp.QuantumCircuit.t_depth>`. It handles
+    Clifford gates, T gates and rotations by multiples of :math:`\pi/4`. Other
+    rotations have no fixed T-depth, since it depends on how they are synthesized,
+    so for programs containing them a custom ``depth_indicator`` is required.
+
+    Parameters
+    ----------
+    meas_behavior : str or callable
+        A string or callable indicating the behavior of the resource computation
+        when measurements are performed. Available strings are ``"0"`` and ``"1"``.
+        A callable must take a JAX PRNG key as input and return a boolean.
+
+    max_qubits : int, optional
+        The maximum number of qubits supported for depth computation.
+        Default is 1024.
+
+    callback_threshold : int or None, optional
+        For very large algorithms, compile time can blow up due to aggressively
+        inlining of the Jax pipeline. ``callback_threshold`` allows to mitigate
+        this by trading compilation speed for execution speed.
+        ``None`` (default) disables callbacks (fastest execution).
+        ``0`` wraps every reused subroutine (fastest compilation).
+        ``500`` is a good middle ground for many large algorithms.
+
+    depth_indicator : callable, optional
+        A function receiving an :ref:`Operation` and returning its T-depth.
+        The default is :func:`~qrisp.t_depth_indicator`. See the examples below.
+
+    Returns
+    -------
+    Callable
+        A decorator producing a function that computes the T-depth required.
+
+    Raises
+    ------
+    ValueError
+        If the default ``depth_indicator`` encounters a rotation that is neither a
+        Clifford nor a T gate.
+
+    Examples
+    --------
+    Let's consider a simple circuit:
+
+    ::
+
+        from qrisp import *
+
+        @t_depth(meas_behavior="0")
+        def circuit():
+            qv = QuantumFloat(2)
+            t(qv[0])
+            cx(qv[0], qv[1])
+            t(qv[1])
+            s(qv[1])
+
+        print(circuit())  # Output: 2
+
+    The CNOT makes the second T gate wait for the first one, and the S gate is a
+    Clifford gate, so the T-depth is 2. This is the same value
+    ``QuantumCircuit.t_depth()`` returns for the same circuit.
+
+    **Custom T-depth indicators**
+
+    A rotation such as ``rx(0.3, qv[0])`` is neither a Clifford nor a T gate, and
+    its T-depth depends on the precision and algorithm used to synthesize it.
+    :func:`~qrisp.t_depth_indicator` raises a ``ValueError`` for such gates.
+    To estimate the T-depth of programs containing them, pass a ``depth_indicator``.
+    It can fall back to :func:`~qrisp.t_depth_indicator` for the other gates:
+
+    ::
+
+        def my_t_depth_indicator(op):
+            try:
+                return t_depth_indicator(op)
+            except ValueError:
+                # Assume a T-depth of 10 per synthesized rotation
+                return 10
+
+        @t_depth(meas_behavior="0", depth_indicator=my_t_depth_indicator)
+        def circuit(phi):
+            qv = QuantumFloat(2)
+            t(qv[0])
+            cx(qv[0], qv[1])
+            rx(phi, qv[1])
+
+        print(circuit(0.3))  # Output: 11
+
+    The indicator is called once per gate while the program is compiled, so its
+    return value must not depend on runtime values. Gate parameters known at
+    compile time are bound, so for example ``rx(np.pi / 2, qv[0])`` is free and
+    ``rx(np.pi / 4, qv[0])`` costs 1. Besides literal values, this includes
+    parameters computed from constants (e.g. ``rx(jnp.pi / 4, qv[0])``), also
+    when they are passed to a :ref:`qache <qache>` function, as long as every call
+    passes the same value. Parameters only known at runtime (e.g. function
+    arguments, as ``phi`` above, or ``jrange`` indices) are passed to the indicator
+    as symbols, so such rotations are never classified as Clifford or T gates.
+
+    Gates with a ``definition`` (for example a Toffoli gate implemented as a
+    sequence of simpler gates) are not passed to the indicator directly: the
+    definition is transpiled and the indicator is called for each gate therein.
+
+    Now, consider a circuit with measurement and classical control:
+
+    ::
+
+        @t_depth(meas_behavior="0")
+        def circuit():
+            qv = QuantumFloat(2)
+            m = measure(qv[0])
+
+            with control(m == 0):
+                h(qv[0])
+                x(qv[1])
+
+            with control(m == 1):
+                t(qv[1])
+                t(qv[1])
+
+        print(circuit())  # Output: 0
+
+    The same circuit with ``meas_behavior="1"`` yields a T-depth of 2,
+    because a different branch of the computation is taken.
+
+    .. note::
+
+        Computing T-depth requires tracking qubit dependencies. As a result,
+        compilation time for the T-depth metric can be noticeably slower for large circuits
+        compared to ``count_ops``. This will be improved in future versions.
+        However, the scalability offered by Jasp after the initial compilation
+        is not affected.
+
+    .. note::
+
+        As in ``QuantumCircuit.t_depth``, non-integer T-depths returned by the
+        indicator are accumulated and the final T-depth is truncated to an integer.
+
+    .. note::
+
+        The compiled computation is cached per ``depth_indicator``. Define the
+        indicator once and reuse it, instead of passing a new ``lambda`` on every
+        call, to avoid recompilation.
+
+    .. note::
+
+        ``meas_behavior="sim"`` is not supported for T-depth.
+
+    .. note::
+
+        The ``max_qubits`` parameter sets an upper limit on the number of qubits
+        that can be handled for depth computation. This is necessary as JAX
+        requires static shapes for JIT compilation. The default value of 1024
+        can be adjusted based on the expected number of qubits in the circuits
+        to be analyzed.
+
+    .. warning::
+
+        It is currently not possible to estimate programs, which include a
+        :ref:`kernelized <quantum_kernel>` function.
+
+    .. warning::
+
+        The T-depth metric is an experimental feature and may not behave as expected in certain edge cases.
+
+        -   The memory management operations ``reset`` and ``delete`` are currently ignored.
+            Qubits freed by these calls still count toward the ``max_qubits`` limit.
+
+        -   Slice bounds follow Python semantics for common cases (negative indices,
+            out-of-bounds clamping, empty slices, etc.). However, non-unit steps are not supported.
+
+    """
+
+    def t_depth_decorator(function):
+        """Turn ``function`` into a function returning its T-depth."""
+
+        def t_depth_counter(*args):
+            """Return the T-depth of ``function`` called with ``args``."""
+            jaspr = get_cached_jaspr(function, args, meas_behavior)
+            return jaspr.t_depth(
+                *args,
+                meas_behavior=meas_behavior,
+                max_qubits=max_qubits,
+                callback_threshold=callback_threshold,
+                depth_indicator=depth_indicator,
+            )
+
+        return t_depth_counter
+
+    return t_depth_decorator
+
+
 def _warn_max_allocations_deprecated() -> None:
     """Warn that the ``max_allocations`` argument of ``num_qubits`` has no effect anymore."""
     warnings.warn(
@@ -638,7 +848,7 @@ def profile_jaspr(jaspr: Jaspr, mode: str, meas_behavior: str | Callable = "0", 
 
     mode : str
         The profiling mode to be used.
-        Currently supported modes are "depth", "count_ops", and "num_qubits".
+        Currently supported modes are "depth", "t_depth", "count_ops", and "num_qubits".
 
     meas_behavior : str or callable, optional
         The measurement behavior to be used during profiling. Default is "0".

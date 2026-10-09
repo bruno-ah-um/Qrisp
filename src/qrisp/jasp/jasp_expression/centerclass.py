@@ -636,6 +636,31 @@ class Jaspr(ClosedJaxpr):
             callback_threshold=callback_threshold,
         )(*args)
 
+    def t_depth(
+        self,
+        *args,
+        meas_behavior: str | Callable,
+        max_qubits: int = 1024,
+        callback_threshold: int | None = None,
+        depth_indicator: Callable | None = None,
+    ) -> Any:
+        """Return the T-depth of this Jaspr evaluated on *args*.
+
+        The T-depth of each gate is given by *depth_indicator*, which defaults to
+        :func:`~qrisp.t_depth_indicator`.
+        """
+        from qrisp.jasp.evaluation_tools import profile_jaspr
+        from qrisp.misc import t_depth_indicator
+
+        return profile_jaspr(
+            self,
+            "t_depth",
+            meas_behavior,
+            max_qubits=max_qubits,
+            callback_threshold=callback_threshold,
+            depth_indicator=t_depth_indicator if depth_indicator is None else depth_indicator,
+        )(*args)
+
     def num_qubits(
         self,
         *args,

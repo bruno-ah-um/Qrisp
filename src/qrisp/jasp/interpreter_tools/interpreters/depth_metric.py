@@ -21,6 +21,8 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.extend.core import ClosedJaxpr, Jaxpr, JaxprEqn, Literal
 from jax.typing import ArrayLike
 
 from qrisp._cache_config import qrisp_lru_compilation_cache
@@ -37,13 +39,14 @@ from qrisp.jasp.jasp_expression import Jaspr
 from qrisp.jasp.primitives import (
     AbstractQubitArray,
 )
+from qrisp.jasp.primitives.operation_primitive import greek_letters
 
 
 def _apply_duration_on_qubits(
     depth_array: jnp.ndarray,
     current_depth: jnp.ndarray,
     qubit_ids: list,
-    duration: jnp.ndarray,
+    duration: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Apply a gate of given duration on the given qubits.
 
@@ -57,8 +60,8 @@ def _apply_duration_on_qubits(
         The depth of the circuit so far.
     qubit_ids : list
         The global ids of the qubits the gate acts on.
-    duration : jnp.ndarray
-        The duration of the gate.
+    duration : float
+        The duration of the gate, cast to the dtype of ``depth_array``.
 
     Returns
     -------
@@ -71,7 +74,7 @@ def _apply_duration_on_qubits(
     qubit_ids_arr = jnp.asarray(qubit_ids, dtype=jnp.int64)
     touched = jnp.take(depth_array, qubit_ids_arr)
     start = jnp.max(touched)
-    end = start + jnp.int64(duration)
+    end = start + jnp.asarray(duration, dtype=depth_array.dtype)
 
     depth_array = depth_array.at[qubit_ids_arr].set(end)
     current_depth = jnp.maximum(current_depth, end)
@@ -200,7 +203,7 @@ def _gate_layers(op, qubits: list) -> Iterator[list]:
 
     """
     if not getattr(op, "definition", None):
-        yield qubits
+        yield op, qubits
         return
 
     transpiled_definition = op.definition.transpile()
@@ -209,9 +212,189 @@ def _gate_layers(op, qubits: list) -> Iterator[list]:
     # ids (integer tracers/array scalars) of the qubits the gate acts on.
     qubit_map = dict(zip(transpiled_definition.qubits, qubits, strict=True))
 
-    for _, inner_def_qubits in _iter_definition_ops(transpiled_definition):
+    for instruction, inner_def_qubits in _iter_definition_ops(transpiled_definition):
         if inner_def_qubits:
-            yield [qubit_map[qb] for qb in inner_def_qubits]
+            yield instruction.op, [qubit_map[qb] for qb in inner_def_qubits]
+
+
+_UNKNOWN = object()
+
+# Primitives calling a sub-jaxpr with their arguments, whose outputs are the outputs of the sub-jaxpr
+_CALL_PRIMITIVES = {"jit", "pjit", "closed_call"}
+
+
+def _as_static_scalar(value):
+    """Return ``value`` as a hashable scalar, or ``_UNKNOWN`` if it is not a static scalar."""
+    if value is _UNKNOWN or isinstance(value, jax.core.Tracer) or np.ndim(value) != 0:
+        return _UNKNOWN
+    return np.asarray(value)[()]
+
+
+def _fold_eqn(eqn: JaxprEqn, invals: list) -> list:
+    """Evaluate a classical equation whose inputs are all static, or return unknown outputs."""
+    unknown = [_UNKNOWN] * len(eqn.outvars)
+    # Effectful equations (e.g. debug prints and callbacks) must not run during the analysis
+    if eqn.primitive.name.startswith("jasp.") or eqn.effects or any(val is _UNKNOWN for val in invals):
+        return unknown
+    try:
+        with jax.ensure_compile_time_eval():
+            outvals = eqn.primitive.bind(*invals, **eqn.params)
+    except Exception:  # noqa: BLE001
+        return unknown
+    if not eqn.primitive.multiple_results:
+        outvals = [outvals]
+    return [_as_static_scalar(val) for val in outvals]
+
+
+def _record_gate_params(eqn: JaxprEqn, invals: list, gate_params: dict) -> None:
+    """Record the values of the parameters of a gate, or ``_UNKNOWN`` if they differ from a previous call."""
+    op = eqn.params["gate"]
+    # Invars are the qubits, then the parameters, then the QuantumState
+    for var, val in zip(eqn.invars[op.num_qubits : -1], invals[op.num_qubits : -1], strict=True):
+        if not isinstance(var, Literal):
+            previous = gate_params.get(var, val)
+            gate_params[var] = val if previous is not _UNKNOWN and previous == val else _UNKNOWN
+
+
+def _fold_unknown_sub_jaxprs(eqn: JaxprEqn, gate_params: dict, memo: dict) -> bool:
+    """Record the gate parameters of the sub-jaxprs of an equation, assuming unknown inputs.
+
+    Returns
+    -------
+    bool
+        Whether the equation has sub-jaxprs.
+
+    """
+    sub_jaxprs = [
+        sub
+        for param in eqn.params.values()
+        for sub in (param if isinstance(param, (tuple, list)) else (param,))
+        if isinstance(sub, (Jaxpr, ClosedJaxpr))
+    ]
+    for sub in sub_jaxprs:
+        num_invars = len((sub.jaxpr if isinstance(sub, ClosedJaxpr) else sub).invars)
+        _fold_jaxpr(sub, [_UNKNOWN] * num_invars, gate_params, memo)
+    return bool(sub_jaxprs)
+
+
+def _fold_jaxpr(jaxpr, invals: list, gate_params: dict, memo: dict) -> list:
+    """Propagate static scalars through a jaxpr, recording the values of gate parameters.
+
+    Equations whose inputs are all static are evaluated, and static values are passed on
+    to the sub-jaxprs of calls, the branches of conditionals and the constants of loop
+    bodies. Since a sub-jaxpr can be called from several places, a gate parameter is
+    recorded as static only if it has the same value at every call site.
+
+    Returns
+    -------
+    list
+        The static values of the outputs of the jaxpr, or ``_UNKNOWN``.
+
+    """
+    consts = []
+    if isinstance(jaxpr, ClosedJaxpr):
+        consts = [_as_static_scalar(const) for const in jaxpr.consts]
+        jaxpr = jaxpr.jaxpr
+
+    key = (id(jaxpr), tuple(invals))
+    if key in memo:
+        return memo[key]
+
+    env = dict(zip(jaxpr.constvars, consts, strict=True))
+    env.update(zip(jaxpr.invars, invals, strict=True))
+
+    def read(var):
+        return _as_static_scalar(var.val) if isinstance(var, Literal) else env.get(var, _UNKNOWN)
+
+    for eqn in jaxpr.eqns:
+        eqn_invals = [read(var) for var in eqn.invars]
+        name = eqn.primitive.name
+        outvals = [_UNKNOWN] * len(eqn.outvars)
+
+        if name == "jasp.quantum_gate":
+            _record_gate_params(eqn, eqn_invals, gate_params)
+        elif name in _CALL_PRIMITIVES:
+            outvals = _fold_jaxpr(eqn.params["jaxpr"], eqn_invals, gate_params, memo)
+        elif name == "cond":
+            # The first operand selects the branch, the others are passed to the branch
+            for branch in eqn.params["branches"]:
+                _fold_jaxpr(branch, eqn_invals[1:], gate_params, memo)
+        elif name == "while":
+            # Only the constants of the body are the same in every iteration
+            cond_nconsts, body_nconsts = eqn.params["cond_nconsts"], eqn.params["body_nconsts"]
+            body_consts = eqn_invals[cond_nconsts : cond_nconsts + body_nconsts]
+            num_carries = len(eqn_invals) - cond_nconsts - body_nconsts
+            _fold_jaxpr(eqn.params["body_jaxpr"], body_consts + [_UNKNOWN] * num_carries, gate_params, memo)
+        elif not _fold_unknown_sub_jaxprs(eqn, gate_params, memo):
+            outvals = _fold_eqn(eqn, eqn_invals)
+
+        env.update(zip(eqn.outvars, outvals, strict=True))
+
+    memo[key] = [read(var) for var in jaxpr.outvars]
+    return memo[key]
+
+
+@qrisp_lru_compilation_cache
+def static_gate_params(jaspr: Jaspr) -> frozenset:
+    """Return the gate parameters of a Jaspr whose values are known at compile time.
+
+    Besides literals, these are parameters computed from constants during tracing,
+    such as ``p(jnp.pi / 4, qv)``, also across calls and conditionals. Parameters that
+    depend on the arguments of the Jaspr or on a loop iteration are not static.
+
+    Parameters
+    ----------
+    jaspr : Jaspr
+        The Jaspr whose gate parameters are inspected.
+
+    Returns
+    -------
+    frozenset[tuple[Var, float]]
+        The static (non-literal) parameter variables of the gate equations with their values.
+
+    """
+    gate_params = {}
+    _fold_jaxpr(jaspr, [_UNKNOWN] * len(jaspr.jaxpr.invars), gate_params, {})
+    return frozenset((var, float(val)) for var, val in gate_params.items() if val is not _UNKNOWN)
+
+
+def _bind_static_params(eqn: JaxprEqn, static_params: dict):
+    """Return the gate of a ``quantum_gate`` equation with its parameters bound, if they are static.
+
+    Parameters that are literals of the Jaspr (e.g. ``rx(0.3, qv)``), or that are
+    computed from constants (see :func:`static_gate_params`), are known at compile
+    time, so the gate can be bound to their values, as the concrete evaluation of the
+    primitive does. If any parameter is traced, the abstract gate is returned.
+
+    Parameters
+    ----------
+    eqn : JaxprEqn
+        A ``jasp.quantum_gate`` equation.
+    static_params : dict
+        The values of the static non-literal gate parameters, by variable.
+
+    Returns
+    -------
+    tuple[Operation, bool]
+        The (possibly bound) gate, and whether all its parameters are static.
+
+    """
+    op = eqn.params["gate"]
+    # Invars are the qubits, then the parameters, then the QuantumState
+    param_vars = eqn.invars[op.num_qubits : -1]
+
+    values = []
+    for var in param_vars:
+        if isinstance(var, Literal):
+            values.append(float(var.val))
+        elif var in static_params:
+            values.append(static_params[var])
+        else:
+            return op, False
+
+    if not values:
+        return op, True
+    return op.bind_parameters({greek_letters[i]: value for i, value in enumerate(values)}), True
 
 
 # The computation will fail anyway if this is triggered,
@@ -249,9 +432,25 @@ class DepthMetric(BaseMetric):
     max_qubits : int, optional
         The maximum number of qubits supported for depth computation. Default is 1024.
 
+    depth_indicator : Callable, optional
+        A function mapping a gate to its depth contribution, e.g. ``t_depth_indicator``.
+        Non-integer values are accumulated as floats and the final depth is truncated,
+        as in ``QuantumCircuit.depth``. ``None`` (default) assigns every gate a depth of 1.
+
+    static_params : frozenset, optional
+        The values of the gate parameters known at compile time, as returned by
+        :func:`static_gate_params`. Gates are bound to them before calling
+        ``depth_indicator``. Literal parameters are always bound.
+
     """
 
-    def __init__(self, meas_behavior: Callable, max_qubits: int = 1024):
+    def __init__(
+        self,
+        meas_behavior: Callable,
+        max_qubits: int = 1024,
+        depth_indicator: Callable | None = None,
+        static_params: frozenset = frozenset(),
+    ):
         """Initialize the DepthMetric."""
         super().__init__(meas_behavior=meas_behavior)
 
@@ -260,21 +459,39 @@ class DepthMetric(BaseMetric):
         # Unfortunately, JAX does not support dynamic arrays (yet).
         # Ideally, we would implement dynamic resizing in the future
         self._max_qubits: int = max_qubits
+        self._depth_indicator = depth_indicator
+        self._static_params = static_params
+        self._static_param_values = dict(static_params)
 
     @property
     def max_qubits(self) -> int:
         """Return the maximum number of qubits supported."""
         return self._max_qubits
 
+    @property
+    def depth_indicator(self) -> Callable | None:
+        """Return the depth indicator, or None for unit depth."""
+        return self._depth_indicator
+
     @classmethod
     def from_cache_key(cls, cache_key) -> "DepthMetric":
-        """Rebuild the metric from its measurement behavior and maximum number of qubits."""
-        meas_behavior, max_qubits = cache_key
-        return cls(meas_behavior, max_qubits)
+        """Rebuild the metric from the key returned by :meth:`cache_key`."""
+        return cls(*cache_key)
 
-    def cache_key(self) -> tuple[Callable, int]:
-        """Return the measurement behavior and the maximum number of qubits as a hashable key."""
-        return (self.meas_behavior, self.max_qubits)
+    def cache_key(self) -> tuple[Callable, int, Callable | None, frozenset]:
+        """Return the measurement behavior, maximum number of qubits, indicator and static parameters."""
+        return (self.meas_behavior, self.max_qubits, self.depth_indicator, self._static_params)
+
+    @property
+    def depth_dtype(self) -> type:
+        """Return the dtype of the depths: float for indicators with fractional durations, int otherwise."""
+        return jnp.int64 if self.depth_indicator is None else jnp.float64
+
+    def _gate_duration(self, op) -> float:
+        """Return the depth contribution of a single (inner) gate."""
+        if self.depth_indicator is None:
+            return 1
+        return float(self.depth_indicator(op))
 
     def initial_metric(self) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Return a circuit of depth zero with no qubits allocated."""
@@ -284,10 +501,11 @@ class DepthMetric(BaseMetric):
         # Here is the explanation of the metric data structure:
         #
         # - depth_array: jnp.ndarray of shape (max_qubits,) that keeps track
-        #   of the depth of each qubit.
+        #   of the depth of each qubit. Its dtype is `depth_dtype`: float when a
+        #   depth indicator may return fractional durations, int otherwise.
         #
-        # - current_depth: integer scalar that keeps track of the current
-        #   maximum depth of the circuit.
+        # - current_depth: scalar of dtype `depth_dtype` that keeps track of the
+        #   current maximum depth of the circuit.
         #
         # - previous_size: integer scalar that keeps track of the
         #   next available index in the depth_array for newly created qubits.
@@ -299,8 +517,8 @@ class DepthMetric(BaseMetric):
         #
         # - meas_count: integer scalar with the number of qubits measured so far,
         #   used to number the measurements (see BaseMetric._sample_measurement).
-        depth_array = jnp.zeros(self.max_qubits, dtype=jnp.int64)
-        current_depth = jnp.int64(0)
+        depth_array = jnp.zeros(self.max_qubits, dtype=self.depth_dtype)
+        current_depth = jnp.zeros((), dtype=self.depth_dtype)
         previous_size = jnp.int64(0)
         invalid = jnp.bool_(False)
         meas_count = jnp.int64(0)
@@ -386,17 +604,23 @@ class DepthMetric(BaseMetric):
         """Advance the depth of the qubits the gate acts on, gate by gate of its definition."""
         depth_array, current_depth, previous_size, invalid, meas_count = invalues[-1]
 
-        op = eqn.params["gate"]
+        # Indicators may depend on the gate parameters: bind them if they are static
+        op = (
+            _bind_static_params(eqn, self._static_param_values)[0]
+            if self.depth_indicator is not None
+            else eqn.params["gate"]
+        )
         # Qubits have been already converted to their integer (possibly traced)
         # indices by the `jasp.get_qubit` primitive handler
         qubits = list(invalues[: op.num_qubits])
 
-        for qubit_ids in _gate_layers(op, qubits):
+        for inner_op, qubit_ids in _gate_layers(op, qubits):
+            duration = self._gate_duration(inner_op)
             depth_array, current_depth = _apply_duration_on_qubits(
                 depth_array=depth_array,
                 current_depth=current_depth,
                 qubit_ids=qubit_ids,
-                duration=jnp.int64(1),
+                duration=duration,
             )
 
         # Associate the following in context_dic:
@@ -486,13 +710,18 @@ def extract_depth(res: tuple, jaspr: Jaspr, _) -> int:
     if overflowed:
         raise ValueError("The depth metric computation overflowed the maximum number of qubits supported.")
 
+    # Truncate fractional depths, as QuantumCircuit.depth does
     return int(depth)
 
 
 # LRU cache controlled by QRISP_COMPILATION_CACHE_SIZE env var
 @qrisp_lru_compilation_cache
 def get_depth_profiler(
-    jaspr: Jaspr, meas_behavior: Callable, max_qubits: int = 1024, callback_threshold: int | None = None
+    jaspr: Jaspr,
+    meas_behavior: Callable,
+    max_qubits: int = 1024,
+    callback_threshold: int | None = None,
+    depth_indicator: Callable | None = None,
 ) -> tuple[Callable, None]:
     """Build a depth profiling computer for a given Jaspr.
 
@@ -513,13 +742,18 @@ def get_depth_profiler(
         disables callbacks entirely (fastest execution).  ``0`` wraps
         every reused sub-jaxpr (fastest compilation).
 
+    depth_indicator : Callable, optional
+        See :class:`DepthMetric`. ``None`` (default) gives the plain circuit depth.
+
     Returns
     -------
     tuple[Callable, None]
         A depth profiler function and None as auxiliary data.
 
     """
-    depth_metric = DepthMetric(meas_behavior, max_qubits)
+    # Only indicators look at the gate parameters
+    static_params = static_gate_params(jaspr) if depth_indicator is not None else frozenset()
+    depth_metric = DepthMetric(meas_behavior, max_qubits, depth_indicator, static_params)
 
     return build_metric_profiler(jaspr, depth_metric, callback_threshold), None
 
